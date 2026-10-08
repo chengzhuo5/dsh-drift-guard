@@ -1,0 +1,40 @@
+# Drift Guard: one Host plugin row. `config` is optional; the values below are
+# the code defaults, repeated here as documentation. Change them after
+# installing if the guard fires too early, too late, or too often.
+- insert:
+    - id: drift-guard
+      name: '@local/dsh-drift-guard'
+      config:
+        # Closed steps after the contract is committed before the guard forces a
+        # checkpoint: continue on the main line, report a direction change, or
+        # stop and report blocked.
+        stepBudget: 30
+        # Closed-step mark at which an agent that never committed a contract is
+        # asked exactly once. There is deliberately no periodic nag.
+        askAnchorAt: 2
+        # Hard cap on forced checkpoints per turn, so the guard cannot spin.
+        maxCheckpointsPerTurn: 2
+        # Cap on checkpoint messages across one contract's lifetime.
+        maxCheckpointMessages: 3
+        # Completeness enforcement. An unfinished must-deliver item steers the
+        # turn instead of letting it close with a confident report.
+        blockUnfinished: true
+        # Deferral-phrase detection: reads the agent's own prose for wording
+        # that announces a subset, a stub, or a postponement.
+        #
+        # SHIPS OFF, and that is a measured decision rather than a cautious
+        # default. Three live runs produced three false positives of the same
+        # kind -- the guard's own policy text, a README excerpt, and the guard's
+        # opening line quoted back in conversation were each read as the agent
+        # announcing a shortfall. Every rule added to suppress that class was
+        # bypassed by the next piece of real prose. Prose about intent has no
+        # discriminative power, because the surrounding text is full of people
+        # *discussing* the very thing being detected.
+        #
+        # It only ever recorded; it never gated anything, so leaving it off
+        # removes noise and no capability. Set true to re-measure it on your own
+        # corpus.
+        reportDeferrals: false
+        # Ask the model to declare must-deliver items (advisory; the gate above
+        # is what actually enforces them).
+        requireCoverage: true

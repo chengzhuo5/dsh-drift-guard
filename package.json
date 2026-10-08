@@ -1,0 +1,37 @@
+{
+  "name": "@local/dsh-drift-guard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Keeps an agent working on the user's original request instead of a self-invented sub-goal, and blocks a labelled subset from being reported as done.",
+  "license": "MIT",
+  "author": "Minar Kotonoha <chengzhuo5@qq.com>",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "agent",
+    "drift",
+    "goal-drift",
+    "guardrail"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "meta": {
+    "title": "Drift Guard",
+    "description": "Anchors the original request, budgets the detour, and blocks silent re-definition of done."
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json"
+  ]
+}

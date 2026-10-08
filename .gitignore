@@ -1,0 +1,18 @@
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# This plugin's own diagnostics (see README: the reload probe and any local
+# scratch harnesses write here)
+*.log
+drift-guard-debug.log
+reload-marker.log
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
