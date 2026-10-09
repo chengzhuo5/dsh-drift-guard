@@ -1560,7 +1560,7 @@ await check('friction: the same call twice asks for a lesson', async () => {
   const same = ['pwsh', { command: 'node check.mjs' }]
   const { request } = await frictionTurn({ calls: [same, same] })
   assert.ok(request !== undefined, 'repeating one call verbatim is a mechanical signal')
-  assert.match(request.content[0].text, /bulk-replace/)
+  assert.match(request.content[0].text, /repeated-call/)
 })
 await check('friction: a twenty-step turn asks for a lesson', async () => {
   const { request } = await frictionTurn({ steps: 20 })

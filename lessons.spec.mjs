@@ -25,6 +25,7 @@ import {
   LESSON_TRIGGERS,
   LESSON_TRIGGER_NAMES,
   activeLessons,
+  callSignature,
   loadLessons,
   recordLesson,
   renderLessons,
@@ -183,6 +184,42 @@ check('render: a retired lesson leaves the active block', () => {
   const text = renderLessons(active)
   assert.equal(text.includes('old rule'), false)
   assert.match(text, /new rule/)
+})
+
+check('triggers: one plain call is not a bulk replace', () => {
+  // The trap found by real use: repeating an ordinary lookup command used to be
+  // reported as "bulk-replace", which is a different thing entirely and misled
+  // whoever had to pick a trigger for the lesson.
+  const once = ['glob', { pattern: '**/lessons.json' }]
+  const fired = triggersForCall(once[0], once[1], { stepsThisTurn: 1 })
+  assert.equal(fired.has('bulk-replace'), false, 'a single lookup is not a bulk rewrite')
+  assert.equal(fired.has('repeated-call'), false, 'and it is not a repeat either')
+})
+check('triggers: repeating one call raises repeated-call, not bulk-replace', () => {
+  const call = ['glob', { pattern: '**/lessons.json' }]
+  const fired = triggersForCall(call[0], call[1], { stepsThisTurn: 1 }, [call, call])
+  assert.equal(fired.has('repeated-call'), true, 'the same call twice is repetition')
+  assert.equal(fired.has('bulk-replace'), false, 'and it is still not a bulk rewrite')
+})
+check('triggers: an actual bulk rewrite raises bulk-replace', () => {
+  const bulk = triggersForCall('shell', { command: "sed -i 's/a/b/' f.js" }, { stepsThisTurn: 1 })
+  assert.equal(bulk.has('bulk-replace'), true, 'sed -i rewrites text in bulk')
+  assert.equal(bulk.has('repeated-call'), false, 'once is not a repeat')
+  const tool = triggersForCall('bulk_replace', {}, { stepsThisTurn: 1 })
+  assert.equal(tool.has('bulk-replace'), true, 'a dedicated bulk tool counts too')
+})
+check('triggers: the two are independently reachable', () => {
+  const call = ['shell', { command: "sed -i 's/a/b/' f.js" }]
+  const both = triggersForCall(call[0], call[1], { stepsThisTurn: 1 }, [call, call])
+  assert.equal(both.has('repeated-call'), true, 'repeating a bulk rewrite is repetition')
+  assert.equal(both.has('bulk-replace'), true, 'and it is also a bulk rewrite')
+})
+check('triggers: every name in the closed set explains itself', () => {
+  assert.ok(LESSON_TRIGGER_NAMES.includes('repeated-call'), 'repeated-call joined the closed set')
+  assert.ok(LESSON_TRIGGER_NAMES.includes('bulk-replace'), 'bulk-replace stayed')
+  for (const name of LESSON_TRIGGER_NAMES) {
+    assert.ok(typeof LESSON_TRIGGERS[name] === 'string' && LESSON_TRIGGERS[name].length > 0)
+  }
 })
 
 const failed = cases.filter(entry => !entry.ok)

@@ -2056,6 +2056,7 @@ export function apply(ctx, config) {
       // a passive observer has no way to make.
       calls: new Map(),
       writes: new Map(),
+      history: [],
       lessonRecorded: false,
     }
   }
@@ -2079,7 +2080,7 @@ export function apply(ctx, config) {
   function frictionForTurn(entry, state) {
     const fired = new Set()
     for (const count of entry.calls?.values() ?? []) {
-      if (count >= REPEAT_CALL_LIMIT) fired.add('bulk-replace')
+      if (count >= REPEAT_CALL_LIMIT) fired.add('repeated-call')
     }
     for (const count of entry.writes?.values() ?? []) {
       if (count >= REPEAT_WRITE_LIMIT) fired.add('before-editing-tests')
@@ -2104,6 +2105,7 @@ export function apply(ctx, config) {
       steers: 0,
       calls: new Map(),
       writes: new Map(),
+      history: [],
       lessonRecorded: false,
     }
   }
@@ -2131,7 +2133,7 @@ export function apply(ctx, config) {
     const state = stateOf(ctx2, agent)
     if (state === undefined || !Array.isArray(state.lessons) || state.lessons.length === 0) return undefined
     const args = argsOf(exec) ?? {}
-    const fired = triggersForCall(exec.name, args, state)
+    const fired = triggersForCall(exec.name, args, state, entryFor2(agent).history ?? [])
     const due = lessonsForTriggers(state.lessons, fired)
     if (due.length === 0) return undefined
     const entry = entryFor2(agent)
@@ -2166,10 +2168,14 @@ export function apply(ctx, config) {
       const writes = new Map(current.writes)
       const target = String(argsOf(exec)?.file_path ?? argsOf(exec)?.path ?? '')
       if (target !== '') writes.set(target, (writes.get(target) ?? 0) + 1)
+      // The same calls, in order, so the reminder path and the friction path agree
+      // on what "repeated" means instead of each inventing its own idea.
+      const history = [...(current.history ?? []), [exec.name, argsOf(exec) ?? {}]].slice(-40)
       memory.set(exec.agent, {
         ...current,
         calls,
         writes,
+        history,
         // The agent recording a lesson is the point of the mechanism, so it is
         // tracked here rather than inferred later from the store's length.
         lessonRecorded: current.lessonRecorded || exec.name === LESSON_TOOL,

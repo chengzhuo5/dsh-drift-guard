@@ -38,6 +38,7 @@ export const LESSONS_FILE = 'lessons.json'
  */
 export const LESSON_TRIGGERS = {
   'bulk-replace': 'You are about to rewrite many occurrences at once (a scripted replace, sed, or a loop doing edits).',
+  'repeated-call': 'You have issued the SAME call more than once in this turn. Repeating a call is not progress: either the first result was not read, or the approach is wrong.',
   'before-editing-tests': 'You are about to edit a test file. Tests are the evidence; changing them changes what counts as proof.',
   'long-turn': 'This turn has run for many steps. Long turns are where the original request quietly stops being in view.',
   'no-contract-yet': 'Several steps have passed with no committed contract, so nothing is being held to the request.',
@@ -189,12 +190,23 @@ const WRITE_TOOL = /^(edit|write|str_replace|multi_edit|apply_patch|create_file)
  * trigger that needed judgement could not be trusted to fire consistently, and a
  * reminder that fires inconsistently teaches the reader to ignore reminders.
  */
-export function triggersForCall(name, args, state) {
+export function triggersForCall(name, args, state, history) {
   const fired = new Set()
   const tool = String(name ?? '')
   const text = tool + ' ' + JSON.stringify(args ?? {})
+  // A property of THIS call: it rewrites text in bulk.
   if (BULK_TOOL.test(tool) || /\bsed\s+-i\b|\bawk\b[^|]*-i\b|\.replaceAll\(/i.test(text)) {
     fired.add('bulk-replace')
+  }
+  // A property of the HISTORY: the same call came round again. Kept separate from
+  // the check above because "I ran the same lookup twice" is not a bulk rewrite,
+  // and reporting it as one made the trigger name a lie about what happened - a
+  // defect that only real use exposed.
+  if (Array.isArray(history) && history.length > 0) {
+    const key = callSignature(name, args)
+    if (history.filter(entry => callSignature(entry?.[0], entry?.[1]) === key).length >= 2) {
+      fired.add('repeated-call')
+    }
   }
   if (WRITE_TOOL.test(tool)) {
     const target = String(args?.file_path ?? args?.path ?? args?.file ?? '')
@@ -205,6 +217,11 @@ export function triggersForCall(name, args, state) {
   const inForce = Boolean(state?.contract) && state?.contractTurn === state?.turnKey
   if (steps >= NO_CONTRACT_STEPS && !inForce) fired.add('no-contract-yet')
   return fired
+}
+
+/** A stable signature for one call, so repetitions of the SAME call are visible. */
+export function callSignature(name, args) {
+  return `${String(name ?? '')} ${JSON.stringify(args ?? {})}`.slice(0, 400)
 }
 
 /** One reminder for a lesson that just fired. */
