@@ -55,6 +55,12 @@ const TUNABLE = {
   askAnchorAt: { type: 'integer', min: 1, max: 6 },
   reportDeferrals: { type: 'boolean' },
   mutationBudget: { type: 'number', min: 0.1, max: 1 },
+  // Steps granted per plan item when the budget is derived from a todo list.
+  budgetStepsPerItem: { type: 'integer', min: 1, max: 20 },
+  // Steps withheld from a derived budget so the commit is not what gets cut.
+  commitReserveSteps: { type: 'integer', min: 0, max: 10 },
+  // Steps after which a long turn with no todo list is asked to plan.
+  planBySteps: { type: 'integer', min: 3, max: 30 },
 }
 
 const sha = text => createHash('sha256').update(text, 'utf8').digest('hex')

@@ -1,7 +1,10 @@
 {
-  "outside": "13d7793c1c8772dd13a91645e72837c00927b1a3a0a23cc9842627cc478a38c1",
+  "outside": "d388aeead1e8bc32dae167e7847ead43d160f86c76622555f43ad61e37c6939a",
   "policyKeys": {
     "stepBudget": 30,
+    "budgetStepsPerItem": 4,
+    "commitReserveSteps": 3,
+    "planBySteps": 8,
     "maxCheckpointsPerTurn": 2,
     "maxCheckpointMessages": 3,
     "askAnchorAt": 2,
