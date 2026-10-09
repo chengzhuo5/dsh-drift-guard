@@ -1113,6 +1113,36 @@ function renderUnfinished(state) {
   return lines.join('\n')
 }
 
+/**
+ * Ask for a lesson before the turn closes.
+ *
+ * The guard states WHAT it counted and stays silent about what it means. It cannot
+ * distinguish an instructive failure from a typo, so it does not pretend to; the agent
+ * knows, and the only part that reliably gets skipped is the act of writing it down.
+ * Refusing is permitted and the turn still closes, because a recording requirement that
+ * hard-blocks would be a gate wearing a request's name - and this is the mechanism whose
+ * whole purpose is to keep endings possible.
+ */
+function renderLessonRequest(state, triggers) {
+  const why = triggers
+    .map(trigger => `- ${trigger}: ${LESSON_TRIGGERS[trigger] ?? ""}`)
+    .join('\n')
+  return [
+    'drift-guard: this turn shows mechanical signs of thrashing, and nothing has been recorded.',
+    '',
+    `Observed: ${why}`,
+    '',
+    'The guard cannot tell whether what happened was instructive or just a typo, so it does not',
+    'guess at the content. You are the only one who knows. Before closing, record it with',
+    `${LESSON_TOOL} if there is something a future session should not have to re-learn: the`,
+    'symptom (what actually went wrong) and the rule (what to do instead). Pick the trigger from',
+    'the closed list that names the situation.',
+    '',
+    'If the friction was incidental and taught nothing, say so and close. An empty lesson is',
+    'worse than none, because a store full of noise is a store nobody reads.',
+  ].join('\n')
+}
+
 /** The one-shot prompt for a session that never committed a contract. */
 function renderAnchorRequest(state) {
   return [
@@ -2015,7 +2045,73 @@ export function apply(ctx, config) {
 
   /** The current guard memory for one agent, or a fresh entry. */
   function entryFor(agent) {
-    return memory.get(agent) ?? { turnKey: null, contractSeq: null, atStep: -1, messages: 0, steers: 0 }
+    return memory.get(agent) ?? {
+      turnKey: null,
+      contractSeq: null,
+      atStep: -1,
+      messages: 0,
+      steers: 0,
+      // Friction evidence. Every field is a COUNT of something the event stream
+      // states outright - never a judgement about whether a call went well, which
+      // a passive observer has no way to make.
+      calls: new Map(),
+      writes: new Map(),
+      lessonRecorded: false,
+    }
+  }
+
+  /** How many times one identical call may repeat before it counts as thrashing. */
+  const REPEAT_CALL_LIMIT = 2
+  /** How many times one file may be written in a turn before it counts as thrashing. */
+  const REPEAT_WRITE_LIMIT = 3
+  /** Steps after which an unfinished turn is worth recording something about. */
+  const LONG_TURN_LIMIT = 20
+
+  /**
+   * Which lesson triggers this turn's own mechanics justify.
+   *
+   * All three are counts, not opinions: the same call twice, one file written
+   * three times, a twenty-step turn. A guard cannot know whether a failure was
+   * instructive - only the agent knows that - so it does not try. What it can do
+   * is notice that this turn involved thrashing and then insist the agent record
+   * whatever it learned, which is the part that would otherwise be skipped.
+   */
+  function frictionForTurn(entry, state) {
+    const fired = new Set()
+    for (const count of entry.calls?.values() ?? []) {
+      if (count >= REPEAT_CALL_LIMIT) fired.add('bulk-replace')
+    }
+    for (const count of entry.writes?.values() ?? []) {
+      if (count >= REPEAT_WRITE_LIMIT) fired.add('before-editing-tests')
+    }
+    const steps = Number.isFinite(state?.stepsThisTurn) ? state.stepsThisTurn : 0
+    if (steps >= LONG_TURN_LIMIT) fired.add('long-turn')
+    return fired
+  }
+
+  /**
+   * A fresh per-turn record. atStep and messages go back to their defaults,
+   * exactly as budgetCheckpoint's own new-request branch does: carrying them over
+   * made the guard believe a checkpoint had already been sent at this step, which
+   * silently suppressed the first one of the new request.
+   */
+  function rebaseForTurn(turnKey) {
+    return {
+      turnKey,
+      contractSeq: null,
+      atStep: -1,
+      messages: 0,
+      steers: 0,
+      calls: new Map(),
+      writes: new Map(),
+      lessonRecorded: false,
+    }
+  }
+
+  /** A stable key for one call, so repetitions of the SAME call are visible. */
+  function callKey(exec) {
+    const args = typeof exec?.data?.arguments === 'string' ? exec.data.arguments : ''
+    return `${exec?.name ?? ''} ${args}`.slice(0, 400)
   }
 
   /**
@@ -2056,6 +2152,29 @@ export function apply(ctx, config) {
   // Enrich, never veto. Post-execute sees every accepted call, including ones a
   // later listener denies, so the checkpoint cannot be starved by policy.
   ctx.on('tools/post-execute', async (exec, _result, next) => {
+    // Friction evidence is accumulated here, because this is the only hook that
+    // sees every accepted call. Counting only: the guard never inspects whether a
+    // call SUCCEEDED, which it cannot know, but it can see the same call twice and
+    // the same file written three times.
+    if (exec?.agent !== undefined) {
+      const state = stateOf(ctx, exec.agent)
+      const entry = entryFor(exec.agent)
+      const current = entry.turnKey === state?.turnKey ? entry : rebaseForTurn(state?.turnKey ?? null)
+      const calls = new Map(current.calls)
+      const key = callKey(exec)
+      calls.set(key, (calls.get(key) ?? 0) + 1)
+      const writes = new Map(current.writes)
+      const target = String(argsOf(exec)?.file_path ?? argsOf(exec)?.path ?? '')
+      if (target !== '') writes.set(target, (writes.get(target) ?? 0) + 1)
+      memory.set(exec.agent, {
+        ...current,
+        calls,
+        writes,
+        // The agent recording a lesson is the point of the mechanism, so it is
+        // tracked here rather than inferred later from the store's length.
+        lessonRecorded: current.lessonRecorded || exec.name === LESSON_TOOL,
+      })
+    }
     const message = budgetCheckpoint(ctx, resolved, exec, memory, entryFor)
     const lesson = lessonReminder(ctx, exec, entryFor)
     const downstream = await next()
@@ -2074,11 +2193,17 @@ export function apply(ctx, config) {
   ctx.on('agent/turn-stopping', ({ agent }) => {
     const state = stateOf(ctx, agent)
     if (state === undefined) return
-    const entry = entryFor(agent)
+    const stored = memory.get(agent)
+    // An agent whose calls were never counted has NO entry yet, and entryFor
+    // hands back a sentinel with turnKey null. Comparing that against the real
+    // turn key made "sameRequest" false, which silently skipped the friction path
+    // for exactly the turns that touched no tools. A missing entry means THIS
+    // turn, rebased to zero - not a different request.
+    const sameRequest = stored !== undefined && stored.turnKey === state.turnKey
+    const entry = sameRequest ? stored : rebaseForTurn(state.turnKey)
     // The request — not the contract — is the boundary. Keying the memory on
     // the contract would let a contract replaced inside one turn reuse a spend
     // the current request already made.
-    const sameRequest = entry.turnKey === state.turnKey
     const steers = sameRequest ? entry.steers : 0
     if (steers >= resolved.maxCheckpointsPerTurn) return
     const spend = { turnKey: state.turnKey, contractSeq: state.contractSeq, atStep: entry.atStep, messages: entry.messages }
@@ -2108,10 +2233,30 @@ export function apply(ctx, config) {
 
     const budget = state.contract.budget ?? resolved.stepBudget
     const used = Math.max(0, state.stepsThisTurn - state.contract.atStep)
-    if (used < budget) return
     // Budget spent and the turn is closing with the checkpoint unanswered.
-    memory.set(agent, { ...spend, steers: steers + 1 })
-    steer(agent, renderCheckpoint(state, resolved.stepBudget))
+    if (used >= budget) {
+      memory.set(agent, { ...spend, steers: steers + 1 })
+      steer(agent, renderCheckpoint(state, resolved.stepBudget))
+      return
+    }
+
+    // Last, and only if nothing more specific already spoke: a turn that thrashed
+    // should leave a lesson behind. The guard states WHAT it counted and stays
+    // silent about what it means, because it cannot tell an instructive failure
+    // from a typo. It insists on the act of recording - the part that gets skipped
+    // - exactly once, inside the same steer budget as everything else. Refusing is
+    // allowed and the turn still closes: a recording requirement that hard-blocks
+    // would be a gate wearing a request's name.
+    // One request per turn, and the flag - not the steer count - is what enforces
+    // it: the count is recomputed from the original entry on every call, so it
+    // alone let a second call through while the cap was still two.
+    if (!entry.lessonRecorded && !entry.lessonRequested) {
+      const fired = frictionForTurn(entry, state)
+      if (fired.size > 0) {
+        memory.set(agent, { ...spend, steers: steers + 1, lessonRequested: true })
+        steer(agent, renderLessonRequest(state, [...fired]))
+      }
+    }
   })
 }
 

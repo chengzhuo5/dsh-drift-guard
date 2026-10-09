@@ -1491,6 +1491,129 @@ await check('lessons: a fired lesson never blocks the call', async () => {
   }
 })
 
+// ============================================ friction asks for a lesson ====
+// The guard counts thrashing and then insists the agent WRITE DOWN what it
+// learned. It never guesses the content: a passive observer cannot tell an
+// instructive failure from a typo, and a store full of guesses is a store nobody
+// reads.
+//
+// The completeness gate is deliberately turned OFF in every case below. It is the
+// more specific finding and wins the one steer by design, so leaving it on would
+// measure that gate instead of this one - which is exactly the mistake the first
+// version of these tests made.
+
+/**
+ * Drive one turn through the post-execute hook, then ask the turn-stopper.
+ * @param calls - entries of [toolName, argsObject], replayed in order.
+ */
+async function frictionTurn({ calls = [], steps = 1, recordLesson = false, blockUnfinished = false } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'drift-friction-'))
+  const file = join(dir, 'lessons.json')
+  const roots = []
+  const host = fakeHost(roots)
+  apply(host.ctx, { lessonsFile: file, blockUnfinished })
+  const projection = host.projectionOf()
+  let state = projection.init()
+  state = projection.apply(state, turnStart())
+  state = projection.apply(state, human('Fix the parser.'))
+  state = projection.apply(state, toolCall('drift_anchor', setArgs({ must_deliver: ['a'] })))
+  for (let i = 0; i < steps; i++) state = projection.apply(state, step())
+  const session = { __state: state, snapshotEvents: () => [] }
+  const agent = { session, id: 'a' }
+  roots.push(agent)
+
+  const post = host.registered.listeners.get('tools/post-execute')[0]
+  for (const [name, args] of calls) {
+    await post({ agent, name, data: { arguments: JSON.stringify(args ?? {}) } }, undefined, () => ({}))
+  }
+  if (recordLesson) {
+    await post({
+      agent,
+      name: 'drift_lesson',
+      data: { arguments: JSON.stringify({ symptom: 's', rule: 'r', trigger: 'long-turn' }) },
+    }, undefined, () => ({}))
+  }
+  const steered = []
+  agent.steer = message => { steered.push(message) }
+  try {
+    host.registered.listeners.get('agent/turn-stopping')[0]({ agent })
+  } finally {
+    delete agent.steer
+  }
+  rmSync(dir, { recursive: true, force: true })
+  return { steered, request: steered.find(m => m.content[0].text.includes('mechanical signs of thrashing')) }
+}
+
+await check('friction: a clean turn is not interrupted', async () => {
+  const { steered } = await frictionTurn({ calls: [['read', { file_path: '/repo/a.js' }]] })
+  assert.equal(steered.length, 0, 'no thrashing means nothing is asked')
+})
+await check('friction: one file written three times asks for a lesson', async () => {
+  const target = '/repo/check.mjs'
+  const { request } = await frictionTurn({
+    calls: [['edit', { file_path: target }], ['edit', { file_path: target }], ['edit', { file_path: target }]],
+  })
+  assert.ok(request !== undefined, 'thrashing on one file is a mechanical signal')
+  assert.match(request.content[0].text, /before-editing-tests/)
+})
+await check('friction: the same call twice asks for a lesson', async () => {
+  const same = ['pwsh', { command: 'node check.mjs' }]
+  const { request } = await frictionTurn({ calls: [same, same] })
+  assert.ok(request !== undefined, 'repeating one call verbatim is a mechanical signal')
+  assert.match(request.content[0].text, /bulk-replace/)
+})
+await check('friction: a twenty-step turn asks for a lesson', async () => {
+  const { request } = await frictionTurn({ steps: 20 })
+  assert.ok(request !== undefined, 'twenty steps is a mechanical signal')
+  assert.match(request.content[0].text, /long-turn/)
+})
+await check('friction: recording a lesson silences the request', async () => {
+  const target = '/repo/check.mjs'
+  const { request } = await frictionTurn({
+    calls: [['edit', { file_path: target }], ['edit', { file_path: target }], ['edit', { file_path: target }]],
+    recordLesson: true,
+  })
+  assert.equal(request, undefined, 'the agent already did the thing being asked for')
+})
+await check('friction: the request names what it counted and refuses to guess', async () => {
+  const { request } = await frictionTurn({ steps: 20 })
+  const text = request.content[0].text
+  assert.match(text, /Observed:/, 'it states its evidence')
+  assert.match(text, /cannot tell whether what happened was instructive or just a typo/,
+    'and it says plainly why it will not write the lesson itself')
+  assert.match(text, /say so and close/, 'closing without recording is allowed')
+})
+await check('friction: a turn that already asked for a lesson does not ask again', async () => {
+  const target = '/repo/check.mjs'
+  const dir = mkdtempSync(join(tmpdir(), 'drift-once-'))
+  const file = join(dir, 'lessons.json')
+  const roots = []
+  const host = fakeHost(roots)
+  apply(host.ctx, { lessonsFile: file, blockUnfinished: false })
+  const projection = host.projectionOf()
+  let state = projection.init()
+  state = projection.apply(state, turnStart())
+  state = projection.apply(state, human('Fix the parser.'))
+  state = projection.apply(state, toolCall('drift_anchor', setArgs({ must_deliver: ['a'] })))
+  for (let i = 0; i < 20; i++) state = projection.apply(state, step())
+  const session = { __state: state, snapshotEvents: () => [] }
+  const agent = { session, id: 'a' }
+  roots.push(agent)
+  const stopping = host.registered.listeners.get('agent/turn-stopping')[0]
+  const steered = []
+  agent.steer = message => { steered.push(message) }
+  try {
+    stopping({ agent })
+    stopping({ agent })
+    stopping({ agent })
+  } finally {
+    delete agent.steer
+  }
+  rmSync(dir, { recursive: true, force: true })
+  const requests = steered.filter(m => m.content[0].text.includes('mechanical signs of thrashing'))
+  assert.equal(requests.length, 1, `it asks once, not until complied with (got ${requests.length})`)
+})
+
 // ==================================================================== report ==
 
 if (failures.length > 0) {
