@@ -30,6 +30,8 @@ import {
   outstandingPlan,
   BUDGET_STEPS_PER_ITEM,
   COMMIT_RESERVE_STEPS,
+  questionOnly,
+  renderQuestionOnlyNotice,
   decorationDensity,
   DECORATION_P90,
   DECORATION_NORMAL,
@@ -1971,6 +1973,48 @@ await check('decoration: fenced code is excluded from the denominator', () => {
 await check('decoration: an empty message is not a division by zero', () => {
   assert.equal(decorationDensity('').per1000, 0)
   assert.equal(decorationDensity(undefined).per1000, 0)
+})
+
+// ====================================== a question is not a delivery ========
+// The user asked twice for this, and the second time made it explicit: do not
+// reply with prose questions and wait. Requirements that are clear should just be
+// done, and a decision that genuinely needs the human should go through the
+// question tool, which stops and asks, rather than a sentence that leaves the
+// turn idle.
+//
+// The mechanical test is narrow on purpose: a reply that ONLY asks, in a turn that
+// DID nothing. A reply that reports work and then asks one thing is normal.
+
+await check('question: a bare question with no work is a question-only reply', () => {
+  assert.equal(questionOnly('Should I use D1 or D2?').isQuestion, true)
+  assert.equal(questionOnly('要不要我改成绝对路径？').isQuestion, true)
+  assert.equal(questionOnly('Which one do you want?').isQuestion, true)
+})
+await check('question: an empty reply counts as asking, because it delivers nothing', () => {
+  assert.equal(questionOnly('').isQuestion, true)
+  assert.equal(questionOnly('   ').isQuestion, true)
+})
+await check('question: a report that ends with a question is NOT question-only', () => {
+  // This is the common good case: work happened, one thing is uncertain.
+  assert.equal(questionOnly('Fixed the parser and ran the tests. Should I also update the docs?').isQuestion, false)
+  assert.equal(questionOnly('已修复解析器并跑完全量测试。要不要顺便更新文档？').isQuestion, false)
+})
+await check('question: a statement with no question is not question-only', () => {
+  assert.equal(questionOnly('Done. The suite is green and the commit is pushed.').isQuestion, false)
+  assert.equal(questionOnly('已完成，套件全绿。').isQuestion, false)
+})
+await check('question: a concrete plan masquerading as a question is not question-only', () => {
+  assert.equal(questionOnly('I will implement D1 now — shall I proceed?').isQuestion, false)
+})
+await check('question: fenced code counts as substance', () => {
+  // A reply carrying a code block has produced something, even if it also asks.
+  assert.equal(questionOnly('Does this look right?\n\n```js\nconst x = 1\n```').isQuestion, false)
+})
+await check('question: the reminder points at the tool, not at more prose', () => {
+  const notice = renderQuestionOnlyNotice()
+  assert.match(notice, /ask_user_question|question tool/i)
+  assert.match(notice, /do not/i)
+  assert.match(notice, /block/i)
 })
 
 // ==================================================================== report ==

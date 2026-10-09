@@ -514,6 +514,8 @@ function initialState() {
   stalledTurns: 0,
   /** Summed decoration density across this request's assistant messages. */
   decorationUnits: 0,
+  /** True while every message this turn only asked, and none delivered. */
+  questionsOnly: true,
     /**
      * The turn key the guard itself asked for a contract in. `null` means it
      * has not asked yet; recording the key keeps the ask one-shot WITHOUT
@@ -621,6 +623,11 @@ function parseState(value) {
     toolsThisTurn: count(raw.toolsThisTurn, 0),
     stalledTurns: count(raw.stalledTurns, 0),
     decorationUnits: count(raw.decorationUnits, 0),
+    // questionsOnly is NOT restored: it means "so far this turn nothing but asking",
+    // and both turn/start and any substantive message reset it. Persisting it would
+    // make a stale false outlive its turn, so it is dropped here and re-derived.
+    questionsOnly: true,
+
     askedAnchorAtTurn: Number.isFinite(raw.askedAnchorAtTurn) ? raw.askedAnchorAtTurn : null,
   }
 }
@@ -837,6 +844,10 @@ function projectionDefinition(options = {}) {
             if (density.chars >= 200) {
               state = { ...state, decorationUnits: (state.decorationUnits ?? 0) + density.per1000 }
             }
+            // "A question is not a delivery": sticky for the turn. One substantive
+            // message clears it, so only a turn that did nothing AND asked is caught.
+            const said = questionOnly(textOfMessage(event.data?.message))
+            if (said.hasSubstance) state = { ...state, questionsOnly: false }
           }
           // Deferral-phrase detection is off by default (see DEFERRAL_MARKERS):
           // three live runs produced three false positives, because real text is
@@ -1688,6 +1699,8 @@ export {
   outstandingPlan,
   BUDGET_STEPS_PER_ITEM,
   COMMIT_RESERVE_STEPS,
+  questionOnly,
+  renderQuestionOnlyNotice,
   decorationDensity,
   DECORATION_P90,
   DECORATION_NORMAL,
@@ -1850,6 +1863,50 @@ function renderPlanFirst(steps) {
   ].join('\n')
 }
 
+/**
+ * A question is not a delivery.
+ *
+ * The user asked for this twice, the second time explicitly: do not reply with a
+ * prose question and wait. If the requirement is clear, do it. If a decision
+ * genuinely needs the human, it goes through the question tool, which stops and
+ * asks - not through a sentence that leaves the turn idle.
+ *
+ * The test is deliberately narrow: a reply that ONLY asks. A reply that reports
+ * work and then asks one thing is the common good case, and is not flagged.
+ */
+function questionOnly(text) {
+  const raw = typeof text === 'string' ? text : ''
+  if (raw.trim().length === 0) return { isQuestion: true, hasSubstance: false, asks: false }
+  const prose = raw.replace(new RegExp(FENCED_CODE.source, 'gm'), '')
+  const hadCode = new RegExp(FENCED_CODE.source, 'gm').test(raw)
+  // Substance: a code block, a completed act, an intent to act, or a plan.
+  const hasSubstance =
+    hadCode ||
+    /\b(done|fixed|added|removed|changed|committed|pushed|ran|wrote|created|implemented|updated|verified)\b/i.test(prose) ||
+    /\b(i('| a)?ll|i will|let me|i am going to)\b/i.test(prose) ||
+    /(已|完成|修好|修复|提交|推送|跑完|写好|加上|删掉|改好|验证)/.test(prose)
+  const asks = /\?|？/.test(raw)
+  return { isQuestion: !hasSubstance && asks, hasSubstance, asks }
+}
+
+/**
+ * Point at the tool, not at more prose.
+ *
+ * The correction is to ask properly - through the question seam, which stops and
+ * waits - or to just do the work when the requirement is already clear. Writing a
+ * question into the reply body and ending the turn does neither.
+ */
+function renderQuestionOnlyNotice() {
+  return [
+    'drift-guard: this turn did nothing and asked a question in prose.',
+    '',
+    'The user has asked for this twice: when the requirement is clear, do it - do not',
+    'end the turn with a question and wait. When a decision genuinely needs the human,',
+    'use ask_user_question, which stops and asks, instead of a sentence in the body.',
+    '',
+    'Do not re-ask what is already settled. This is asked once and blocks nothing.',
+  ].join('\n')
+}
 /**
  * Decoration density: how much costume a message wears per character of content.
  *
@@ -2477,6 +2534,7 @@ export function apply(ctx, config) {
       planReminded: false,
       planFirstAsked: false,
       decorationReminded: false,
+      questionReminded: false,
     }
   }
 
