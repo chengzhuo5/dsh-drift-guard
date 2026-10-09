@@ -30,6 +30,9 @@ import {
   outstandingPlan,
   BUDGET_STEPS_PER_ITEM,
   COMMIT_RESERVE_STEPS,
+  decorationUnits,
+  decorationRatio,
+  totalDecoration,
   proseQuestion,
   renderProseQuestionNotice,
   questionOnly,
@@ -1961,7 +1964,7 @@ await check('decoration: each marker family is counted separately', () => {
 })
 await check('decoration: the threshold comes from measurement, not taste', () => {
   // p90 of real traffic. Anything inside normal traffic must not be flagged.
-  assert.equal(DECORATION_P90, 40)
+  assert.equal(DECORATION_P90, 36)
   assert.ok(DECORATION_NORMAL < DECORATION_P90, 'normal sits below the trigger')
 })
 await check('decoration: fenced code is excluded from the denominator', () => {
@@ -2060,6 +2063,58 @@ await check('template: the reminder points at the tool and blocks nothing', () =
   assert.match(notice, /ask_user_question|question tool/i)
   assert.match(notice, /update the docs/, 'the evidence appears in the reminder')
   assert.match(notice, /block/i)
+})
+
+// ===== density is a RATIO: sum the counts, then divide ======================
+// The detector fired on the guard's own reply with "5767 units per 1000
+// characters". Normal traffic is 11 and the trigger is 36, so 5767 was not a
+// strict reading - it was a broken one. The cause: density was accumulated by
+// ADDING each message's per-1000 ratio. Ratios do not add. A 20-character message
+// with four bold runs scores 200 on its own, and a few of those swamp the total
+// no matter how long the actual reply was.
+//
+// The fix is the ordinary one: keep the raw counts and the raw characters, and
+// divide once at the end.
+
+await check('density: short decorated messages do not add up into nonsense', () => {
+  const short = '**a** **b**'
+  const many = Array.from({ length: 6 }, () => short).join('\n')
+  const ratio = totalDecoration(many)
+  // Measured max over 148 real replies is 73.4, so this deliberately fragmentary
+  // string must still land in the same order of magnitude. The sum-of-ratios version
+  // produced thousands here.
+  assert.ok(ratio < 500, `ratio must not explode (got ${ratio})`)
+})
+await check('density: the ratio is counts over characters, not a sum of ratios', () => {
+  // Same decoration, more prose: the ratio must FALL. Adding per-message ratios
+  // cannot do this, because prose adds ratio-free messages and does not divide.
+  const dense = '**a** **b** **c** **d**'
+  const padded = dense + '\n' + 'plain sentence with no decoration at all. '.repeat(40)
+  assert.ok(
+    totalDecoration(padded) < totalDecoration(dense),
+    'padding the same decoration with plain prose must lower the density'
+  )
+})
+await check('density: real traffic scale is reachable', () => {
+  // The measured p50 is 14 and p90 is 40. A realistic mixed reply must land in
+  // that range rather than orders of magnitude above it.
+  const realistic = [
+    '## Heading',
+    '',
+    'A paragraph of ordinary prose that carries the actual content here.',
+    '',
+    '| a | b |',
+    '|---|---|',
+    '| 1 | 2 |',
+    '',
+    '**One emphasised phrase** and one (aside).',
+  ].join('\n')
+  const ratio = totalDecoration(realistic)
+  assert.ok(ratio > 5 && ratio < 150, `realistic decoration should be tens, got ${ratio}`)
+})
+await check('density: an undecorated long reply is essentially zero', () => {
+  const prose = 'This reply is entirely plain sentences with no decoration whatsoever. '.repeat(20)
+  assert.equal(totalDecoration(prose), 0)
 })
 
 // ==================================================================== report ==

@@ -512,8 +512,10 @@ function initialState() {
   toolsThisTurn: 0,
   /** Consecutive turn endings that used no tool at all. Cleared by any tool call. */
   stalledTurns: 0,
-  /** Summed decoration density across this request's assistant messages. */
+  /** Raw decoration units summed across this request's assistant messages. */
   decorationUnits: 0,
+  /** Raw prose characters summed alongside the units, so the ratio divides once. */
+  decorationChars: 0,
   /** True while every message this turn only asked, and none delivered. */
   questionsOnly: true,
   /** Whether the question tool ran this turn. Using it IS the correct form. */
@@ -627,6 +629,7 @@ function parseState(value) {
     toolsThisTurn: count(raw.toolsThisTurn, 0),
     stalledTurns: count(raw.stalledTurns, 0),
     decorationUnits: count(raw.decorationUnits, 0),
+    decorationChars: count(raw.decorationChars, 0),
     // questionsOnly is NOT restored: it means "so far this turn nothing but asking",
     // and both turn/start and any substantive message reset it. Persisting it would
     // make a stale false outlive its turn, so it is dropped here and re-derived.
@@ -852,9 +855,16 @@ function projectionDefinition(options = {}) {
           // not deferral detection is switched on.
           {
             const said_text = textOfMessage(event.data?.message)
-            const density = decorationDensity(said_text)
-            if (density.chars >= 200) {
-              state = { ...state, decorationUnits: (state.decorationUnits ?? 0) + density.per1000 }
+            const measure = decorationDensity(said_text)
+            if (measure.chars >= 200) {
+              // Accumulate RAW units and RAW characters. Dividing here and summing
+              // the quotients is what produced 5767 units per 1000 characters on a
+              // live reply, against a normal-traffic median of 14.
+              state = {
+                ...state,
+                decorationUnits: (state.decorationUnits ?? 0) + decorationUnits(said_text),
+                decorationChars: (state.decorationChars ?? 0) + measure.chars,
+              }
             }
             // "A question is not a delivery": sticky for the turn. One substantive
             // message clears it, so only a turn that did nothing AND asked is caught.
@@ -1727,6 +1737,9 @@ export {
   COMMIT_RESERVE_STEPS,
   proseQuestion,
   renderProseQuestionNotice,
+  decorationUnits,
+  decorationRatio,
+  totalDecoration,
   questionOnly,
   renderQuestionOnlyNotice,
   decorationDensity,
@@ -1891,6 +1904,36 @@ function renderPlanFirst(steps) {
   ].join('\n')
 }
 
+/** The decoration units in one piece of text, before any normalisation. */
+function decorationUnits(text) {
+  const measure = decorationDensity(text)
+  // Recover the raw units from the measurement so there is one definition of what
+  // counts as decoration, and only one place that decides the weights.
+  const { emoji, bold, tag, table, arrow } = measure.counts
+  return bold * 2 + emoji * 1.5 + tag * 1.5 + table * 1.5 + arrow * 1
+}
+
+/**
+ * Density as a RATIO: total units over total characters, computed once.
+ *
+ * The first version added each message's per-1000 ratio. Ratios do not add, and
+ * the result was a live misfire on the guard's own reply: 5767 units per 1000
+ * characters, against a normal-traffic median of 14. A 20-character message with
+ * four bold runs scores 200 on its own, and a handful of those swamp the total
+ * regardless of how long the reply actually was.
+ */
+function decorationRatio(units, chars) {
+  const total = Number.isFinite(chars) ? chars : 0
+  if (total <= 0) return 0
+  return ((Number.isFinite(units) ? units : 0) / total) * 1000
+}
+
+/** Density of a single text, used by tests and by the per-message accumulation. */
+function totalDecoration(text) {
+  const measure = decorationDensity(text)
+  return decorationRatio(decorationUnits(text), measure.chars)
+}
+
 /**
  * Asking the user to decide, in prose, instead of through the question tool.
  *
@@ -2002,9 +2045,13 @@ function renderQuestionOnlyNotice() {
  * What this deliberately does NOT do: judge wording. Stale phrasing and unnatural
  * tone are semantic, and this project measured that class of judgement at 6.2%.
  */
-const DECORATION_P90 = 40
+// Percentiles of the RATIO over whole replies: p50 11.4 | p75 23.6 | p90 35.5 |
+// p99 72.8 | max 73.4, measured over 148 real replies. These are not the old
+// per-message numbers - the quantity changed to units/characters for the whole
+// reply, so it had to be re-measured rather than carried over.
+const DECORATION_P90 = 36
 /** The median of real traffic, quoted in the reminder so the number has context. */
-const DECORATION_NORMAL = 14
+const DECORATION_NORMAL = 11
 
 const FENCED_CODE = /^[ \t]*```[\s\S]*?^[ \t]*```[ \t]*$/gm
 const INLINE_CODE = /`[^`\n]*`/g
@@ -2774,7 +2821,7 @@ export function apply(ctx, config) {
     // Decoration: costumes per character, not words. Length was flat while table
     // rows and bold headings climbed, so "verbose" here means "wearing more
     // costume per sentence" - which is countable. Wording is not, and is not judged.
-    const decorated = Number.isFinite(state.decorationUnits) ? state.decorationUnits : 0
+    const decorated = decorationRatio(state.decorationUnits, state.decorationChars)
     if (decorated >= DECORATION_P90 && entry.decorationReminded !== true) {
       memory.set(agent, { ...spend, steers: steers + 1, decorationReminded: true })
       steer(agent, renderDecorationNotice(decorated))
