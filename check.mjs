@@ -30,6 +30,9 @@ import {
   outstandingPlan,
   BUDGET_STEPS_PER_ITEM,
   COMMIT_RESERVE_STEPS,
+  detailOnly,
+  renderSelfSettleNotice,
+  buildDirectionQuestion,
   decorationUnits,
   decorationRatio,
   totalDecoration,
@@ -2115,6 +2118,53 @@ await check('density: real traffic scale is reachable', () => {
 await check('density: an undecorated long reply is essentially zero', () => {
   const prose = 'This reply is entirely plain sentences with no decoration whatsoever. '.repeat(20)
   assert.equal(totalDecoration(prose), 0)
+})
+
+// ============ do not hand a detail back that you can settle yourself =========
+// The user's complaint, verbatim: "your question is verbose and mixes Chinese with
+// English. Besides, this is a detail you could have thought through and answered
+// yourself - there was no need to ask me."
+//
+// The screenshot shows the tell: the report's OWN description already carried the
+// measurement that settled it ("the premise was overturned by measurement... so B's
+// main rationale no longer stands"), and it still ended with "How should I proceed?"
+// That is the mechanical signature worth catching: the sender has the answer in hand.
+
+await check('detail: a report that settles its own question is refused', () => {
+  const description = 'T1 的前提被实测推翻：实测全表扫描 372 ms，A 的读放大合计每天不到 20 秒。所以 B 的主要理由不再成立，需要你重新裁一次。'
+  assert.equal(detailOnly(description).selfSettled, true)
+  assert.match(detailOnly(description).evidence, /不再成立|不到 20 秒/)
+})
+await check('detail: explicit self-answer language is refused', () => {
+  assert.equal(detailOnly('这个我已经能自己回答，只是列出来给你看。').selfSettled, true)
+  assert.equal(detailOnly('This is a detail I could settle myself.').selfSettled, true)
+  assert.equal(detailOnly('不涉及方向，只是实现细节，我自己定就行。').selfSettled, true)
+})
+await check('detail: a genuine direction change is still allowed through', () => {
+  // No self-answer language, and the description names a real direction question.
+  assert.equal(detailOnly('要把不变量改成运行时校验，这会改变已发布的行为，需要你定。').selfSettled, false)
+  assert.equal(detailOnly('改 A 还是改 B 会决定是否新增一个对外接口，请你选。').selfSettled, false)
+})
+await check('detail: the refusal is actionable and does not bounce it back', () => {
+  const notice = renderSelfSettleNotice(3)
+  assert.match(notice, /自己/)
+  assert.match(notice, /不(必|要|该)/)
+  // It must not contain the old bounce-back phrasing.
+  assert.doesNotMatch(notice, /How should I proceed/)
+})
+await check('detail: the question template is Chinese and bounded', () => {
+  const question = buildDirectionQuestion({
+    description: '要把不变量改成运行时校验，这会改变已发布的行为。',
+    reason: 'behavior-change',
+    options: [{ label: '选项一' }, { label: '选项二' }],
+  })
+  const asciiWords = String(question.text).match(/\b[A-Za-z]{4,}\b/g) ?? []
+  // Field names and the taxonomy token are identifiers, not prose; prose must be
+  // Chinese. Allow only a small fixed set through.
+  const allowed = new Set(['behavior', 'change'])
+  const proseWords = asciiWords.filter(word => !allowed.has(word.toLowerCase()))
+  assert.ok(proseWords.length <= 3, `template carries English prose: ${proseWords.join(',')}`)
+  assert.ok(String(question.text).length <= 400, 'the question is capped in length')
 })
 
 // ==================================================================== report ==

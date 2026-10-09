@@ -1737,6 +1737,9 @@ export {
   COMMIT_RESERVE_STEPS,
   proseQuestion,
   renderProseQuestionNotice,
+  detailOnly,
+  renderSelfSettleNotice,
+  buildDirectionQuestion,
   decorationUnits,
   decorationRatio,
   totalDecoration,
@@ -1911,6 +1914,63 @@ function decorationUnits(text) {
   // counts as decoration, and only one place that decides the weights.
   const { emoji, bold, tag, table, arrow } = measure.counts
   return bold * 2 + emoji * 1.5 + tag * 1.5 + table * 1.5 + arrow * 1
+}
+
+/**
+ * Is this report settling its own question?
+ *
+ * The user's complaint, verbatim: "your question is verbose and mixes Chinese with
+ * English. Besides, this is a detail you could have thought through and answered
+ * yourself - there was no need to ask me."
+ *
+ * They were right, and the report's own text is the tell: the description already
+ * carried the measurement that decided the matter ("实测全表扫描 372 ms ... B 的
+ * 主要理由不再成立"), and it still closed with "How should I proceed?". When the
+ * sender has reached a conclusion, or says outright that it can answer this itself,
+ * the question is not a direction change - it is a detail handed back.
+ *
+ * This does not block real direction changes: those name a change of behaviour,
+ * interface, data or objective, and carry no self-answer language.
+ */
+function detailOnly(description) {
+  const text = typeof description === 'string' ? description : ''
+  if (text.trim().length === 0) return { selfSettled: false, evidence: '' }
+  const explicit = /(已经(能|可以)自己(回答|决定|定)|我(可以)?自己(就能)?(定|决定|判断|回答)|自己(思考|想)一?下?(就)?(能|可以)|不涉及方向|只是(实现)?细节|不必(问|请示)|无需(问|确认)|could (settle|answer|decide) (this )?myself|I can (settle|decide) this myself|no need to ask)/i
+  const concluded = /(前提(被|已)?(实测)?推翻|(被|已)?实测?推翻|不再成立|已经不成立|实测(证明|显示|表明)|测量(结果)?(显示|表明)|因此(选|用|改)|结论(是|已经))/i
+  const change = /(改变|变更|新增|删除|对外|接口|数据模型|兼容|行为|目标|契约|breaking|interface|data model|objective)/i
+  // Quote the whole sentence that carries the conclusion, not the matched fragment:
+  // a fragment like "不再成立" tells the agent nothing about what it already settled.
+  const sentenceWith = re => {
+    const parts = text.split(/(?<=[。！？!?；;])|\n+/).map(part => part.trim()).filter(Boolean)
+    return parts.find(part => re.test(part)) ?? ''
+  }
+  if (explicit.test(text)) return { selfSettled: true, evidence: sentenceWith(explicit).slice(0, 200) }
+  if (concluded.test(text) && !change.test(text)) {
+    return { selfSettled: true, evidence: sentenceWith(concluded).slice(0, 200) }
+  }
+  return { selfSettled: false, evidence: '' }
+}
+
+/** Tell the agent to settle it, instead of handing a detail back. */
+function renderSelfSettleNotice(optionCount) {
+  const n = Number.isFinite(optionCount) ? optionCount : 0
+  return [
+    'drift-guard: 这个不必问你。',
+    '',
+    '报告里已经写下了决定它的实测结果，那就自己定，不要把它当成方向变更交回来。',
+    n > 0 ? `你已经列了 ${n} 个候选：选一个，或者砍到两个，然后做。` : '自己选一个，然后做。',
+    '',
+    '只有真正改变行为、接口、数据或目标的决定才值得问，而且要用提问工具问一次问清。',
+    '细节和取舍自己定。只提醒一次，不阻断。',
+  ].join('\n')
+}
+
+/** Build the single question the guard asks when a change really is the user's. */
+function buildDirectionQuestion(requested) {
+  const reason = String(requested?.reason ?? '')
+  const description = String(requested?.description ?? '')
+  const text = `方向变更（${reason}）：${description}`.slice(0, 400)
+  return { text, reason, description }
 }
 
 /**
@@ -2391,10 +2451,26 @@ export function apply(ctx, config) {
             + 'Stop and report the direction change in your final message instead of deciding it yourself.',
         }
       }
+      // A report that already reached its conclusion is not a direction change - it
+      // is a detail handed back. The user's complaint, verbatim: "this is a detail
+      // you could have thought through and answered yourself - there was no need to
+      // ask me." Answer it here instead of forwarding the ball.
+      const settled = detailOnly(requested.description)
+      if (settled.selfSettled) {
+        return {
+          ...recorded,
+          question: null,
+          decision: 'self-settled',
+          note: renderSelfSettleNotice(presented.length),
+          outcome: 'The guard refused to forward this: the report settles its own question, '
+            + 'so the change is not a direction change. Decide it yourself and do the work.',
+        }
+      }
+      const built = buildDirectionQuestion(requested)
       const question = {
         id: `${DRIFT_TOOL}-${globalThis.crypto.randomUUID().slice(0, 8)}`,
-        header: 'Direction change',
-        question: `This would change the task direction: ${requested.description} (reason: ${requested.reason}). How should I proceed?`,
+        header: '方向变更',
+        question: built.text,
         options: presented.map(option => (
           option.description === undefined
             ? { label: option.label }
@@ -2402,7 +2478,7 @@ export function apply(ctx, config) {
         )),
       }
       if (requested.required_change !== undefined) {
-        question.detail = `Required contract change: ${requested.required_change}`
+        question.detail = `需要改成什么契约：${requested.required_change}`
       }
 
       let mapped
