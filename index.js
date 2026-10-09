@@ -1637,6 +1637,13 @@ function budgetCheckpoint(ctx, resolved, exec, memory, entryFor) {
   const budget = state.contract.budget ?? resolved.stepBudget
   const used = Math.max(0, state.stepsThisTurn - state.contract.atStep)
   if (used < budget) return undefined
+  // A checkpoint asks the agent to audit progress. When every must-deliver item
+  // already carries an authorizing verdict there is nothing left to audit, and
+  // asking anyway is pure noise — the kind that trains the reader to ignore the
+  // guard. (The turn-stopping gate has always had this guard; the message path
+  // was missing it, so a long but *finished* request was nagged on every
+  // further step.)
+  if (unfinishedItems(state).length === 0) return undefined
   if (seen.messages >= resolved.maxCheckpointMessages || seen.atStep === state.stepsThisTurn) return undefined
   memory.set(agent, { ...seen, atStep: state.stepsThisTurn, messages: seen.messages + 1 })
   return contextMessage(

@@ -30,6 +30,13 @@ const MUTATIONS = [
     }],
   },
   {
+    label: 'checkpoint ignores a finished ledger (the nag-after-done bug)',
+    needles: [{
+      from: 'if (unfinishedItems(state).length === 0) return undefined',
+      to: 'if (false) return undefined',
+    }],
+  },
+  {
     label: 'deferral detector without the work-verb requirement (false positives)',
     needles: [{ from: 'if (!WORK_VERBS.test(sentence)) continue', to: 'if (false) continue' }],
   },

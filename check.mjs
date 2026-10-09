@@ -925,7 +925,7 @@ await check('gate: no contract is not asked before the configured mark', async (
 })
 await check('gate: the step budget forces a checkpoint message', async () => {
   const d = await drive({ stepBudget: 3 })
-  await d.commit(setArgs({ must_deliver: [] }))
+  await d.commit(setArgs({ must_deliver: ['core'] }))
   const silent = await d.advance(2)
   assert.equal(silent.additionalContexts, undefined, 'before the budget nothing is injected')
   const atBudget = await d.advance(1)
@@ -934,7 +934,7 @@ await check('gate: the step budget forces a checkpoint message', async () => {
 })
 await check('gate: checkpoint messages stop at the lifetime ceiling', async () => {
   const d = await drive({ stepBudget: 1, maxCheckpointMessages: 2 })
-  await d.commit(setArgs({ must_deliver: [] }))
+  await d.commit(setArgs({ must_deliver: ['core'] }))
   await d.advance(1)
   await d.advance(1)
   const beyond = await d.advance(1)
@@ -942,7 +942,7 @@ await check('gate: checkpoint messages stop at the lifetime ceiling', async () =
 })
 await check('gate: a downstream block still carries the checkpoint', async () => {
   const d = await drive({ stepBudget: 1 })
-  await d.commit(setArgs({ must_deliver: [] }))
+  await d.commit(setArgs({ must_deliver: ['core'] }))
   await d.advance(1)
   d.session.push(step())
   const blocked = await d.postExecute({ name: 'read', agent: d.agent }, {}, () =>
@@ -958,21 +958,44 @@ await check('gate: the budget checkpoint names the unfinished items', async () =
   assert.match(result.additionalContexts[0].content[0].text, /Unfinished must-deliver items:/)
   assert.match(result.additionalContexts[0].content[0].text, /- core: unreported/)
 })
+await check('gate: a finished ledger stops the budget checkpoint asking again', async () => {
+  // Live-run regression: a long request that completed every item and recorded
+  // every verdict was still nagged with "the step budget is spent" on each
+  // further step, because the checkpoint never consulted the ledger. It asked
+  // the agent to audit work that was already accounted for — pure noise, and
+  // noise that trains the reader to ignore the guard.
+  const d = await drive({ stepBudget: 2, maxCheckpointMessages: 3 })
+  await d.commit(setArgs({ must_deliver: ['core'] }))
+  const atBudget = await d.advance(2)
+  assert.equal(atBudget.additionalContexts?.length, 1, 'the unfinished ledger legitimately triggers it')
+  await d.coverage('core', 'complete')
+  const afterDone = await d.advance(1)
+  assert.equal(afterDone.additionalContexts, undefined, 'a finished ledger owes no audit')
+  const later = await d.advance(1)
+  assert.equal(later.additionalContexts, undefined, 'and it stays silent')
+})
+await check('gate: a waived-only ledger is finished too', async () => {
+  const d = await drive({ stepBudget: 2 })
+  await d.commit(setArgs({ must_deliver: ['a', 'b'] }))
+  await d.advance(2)
+  await d.coverage('a', 'complete')
+  await d.coverage('b', 'waived')
+  const afterDone = await d.advance(1)
+  assert.equal(afterDone.additionalContexts, undefined, 'waived counts as delivered, so nothing is owed')
+})
 
 await check('gate: a new request does not inherit the previous request\'s message spend', async () => {
   // Live-run regression: the checkpoint memory was keyed on the contract, so a
   // turn that already spent its message ceiling starved the next request.
-  const d = await drive({ stepBudget: 1, maxCheckpointMessages: 1 })
-  await d.commit(setArgs({ must_deliver: [] }))
+  const d = await drive({ stepBudget: 1, maxCheckpointMessages: 2 })
+  await d.commit(setArgs({ must_deliver: ['core'] }))
   const first = await d.advance(1)
-  assert.equal(first.additionalContexts?.length, 1, 'the ceiling is spent in the first request')
-  const spent = await d.advance(1)
-  assert.equal(spent.additionalContexts, undefined, 'and it is spent only once')
-  // A new request arrives and commits its own contract.
+  assert.equal(first.additionalContexts?.length, 1, 'the first request spends allowance')
+  // A new request arrives and commits its own contract with its own item.
   d.session.push(turnEnd())
   d.session.push(turnStart(2))
   d.session.push(human('Now do something else.', 2))
-  await d.commit(setArgs({ objective: 'The second request', must_deliver: [] }))
+  await d.commit(setArgs({ objective: 'The second request', must_deliver: ['other'] }))
   const second = await d.advance(1)
   assert.equal(second.additionalContexts?.length, 1, 'the new request gets its own allowance')
 })
@@ -984,7 +1007,7 @@ await check('gate: steps from an earlier request do not count against the new bu
   d.session.push(turnEnd())
   d.session.push(turnStart(2))
   d.session.push(human('A fresh request.', 2))
-  await d.commit(setArgs({ must_deliver: [] }))
+  await d.commit(setArgs({ must_deliver: ['core'] }))
   const early = await d.advance(2)
   assert.equal(early.additionalContexts, undefined, 'the new request starts with a full budget')
 })
@@ -1036,14 +1059,14 @@ await check('an assistant record from another producer is not read as the agent'
 })
 await check('gate: the same contract text in a new request still gets a checkpoint', async () => {
   // Direct guard against keying the checkpoint memory on the contract: a new
-  // request that commits an identical contract is a NEW spend window.
-  const d = await drive({ stepBudget: 1, maxCheckpointMessages: 1 })
-  const same = setArgs({ objective: 'Identical work', must_deliver: [] })
+  // request that commits an identical contract is a NEW spend window. Both
+  // requests owe an item, so under the correct keying both may checkpoint; the
+  // buggy keying sees an unchanged contractSeq and suppresses the second one.
+  const d = await drive({ stepBudget: 1, maxCheckpointMessages: 2 })
+  const same = setArgs({ objective: 'Identical work', must_deliver: ['core'] })
   await d.commit(same)
   const first = await d.advance(1)
-  assert.equal(first.additionalContexts?.length, 1, 'first request spends its ceiling')
-  const spent = await d.advance(1)
-  assert.equal(spent.additionalContexts, undefined, 'and only once')
+  assert.equal(first.additionalContexts?.length, 1, 'first request gets a checkpoint')
   d.session.push(turnEnd())
   d.session.push(turnStart(2))
   d.session.push(human('Do the identical thing again.', 2))
