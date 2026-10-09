@@ -166,11 +166,11 @@ const COVERAGE_STATES = ['complete', 'partial', 'missing', 'waived']
 //   - An edit that changes any pinned hash is REJECTED, not warned about.
 const POLICY = {
   stepBudget: 30,
-  /** Steps granted per plan item when a budget is derived from a todo list. */
+  // Steps granted per plan item when a budget is derived from a todo list.
   budgetStepsPerItem: 4,
-  /** Steps withheld from a derived budget so the commit is not the thing that gets cut. */
+  // Steps withheld from a derived budget so the commit is not what gets cut.
   commitReserveSteps: 3,
-  /** Steps after which a long turn with no todo list at all is asked to plan. */
+  // Steps after which a long turn with no todo list at all is asked to plan.
   planBySteps: 8,
   maxCheckpointsPerTurn: 2,
   maxCheckpointMessages: 3,
