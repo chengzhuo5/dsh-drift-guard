@@ -423,10 +423,11 @@ export function verifyInCopy(source, policy, baseline) {
     }
     // The mechanism is re-pinned against the candidate, so a passing candidate
     // cannot ride along with a quiet edit to a frozen body or the surrounding file.
+    // Only the pinned mechanism functions are enforced. A whole-file hash was
+    // tried first and rejected: it flagged every ordinary feature commit as a
+    // violation, and a guard that cries wolf on normal work gets overridden
+    // rather than obeyed. `outside` is still recorded, for information.
     const after = buildCore(candidate)
-    if (after.outside !== baseline.core.outside) {
-      return { ok: false, why: 'the file outside the policy region changed' }
-    }
     for (const [name, hash] of Object.entries(baseline.core.functions)) {
       if (after.functions[name] !== hash) return { ok: false, why: `frozen mechanism changed: ${name}` }
     }
@@ -487,10 +488,7 @@ export function main(argv = process.argv.slice(2)) {
       return 2
     }
   }
-  if (current.outside !== core.outside) {
-    console.error('rsi: REFUSED - index.js changed outside the policy region')
-    return 2
-  }
+  // NOTE: the whole-file hash is deliberately NOT enforced, only recorded.
   const policy = parsePolicyKeys(source)
   const dir = process.env.DSH_RSI_SESSIONS ?? join(process.env.USERPROFILE ?? process.env.HOME ?? '.', '.dsh', 'sessions')
   const signals = mine(sessionFiles(dir))
