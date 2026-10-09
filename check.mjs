@@ -1614,6 +1614,140 @@ await check('friction: a turn that already asked for a lesson does not ask again
   assert.equal(requests.length, 1, `it asks once, not until complied with (got ${requests.length})`)
 })
 
+// ============================================ stalling across turns ========
+// Measured on 194 real session logs: the loop is NOT "many tool-free messages
+// inside one turn" (that happened in 1 turn out of 2200). It is "each turn ends
+// with no tool call, and the auto-continuation re-arms" - 278 such turns, the
+// longest run 157. So what is counted is consecutive tool-free turn ENDINGS.
+
+/**
+ * Fold one whole turn into a fresh projection and report the stall counter.
+ * @param turns - [{ tools: number }] one entry per turn, tools = calls made.
+ */
+function stallAfter(turns) {
+  const roots = []
+  const host = fakeHost(roots)
+  apply(host.ctx, {})
+  const projection = host.projectionOf()
+  let state = projection.init()
+  for (const turn of turns) {
+    state = projection.apply(state, turnStart())
+    for (let i = 0; i < (turn.tools ?? 0); i++) {
+      state = projection.apply(state, toolCall('read', { file_path: '/repo/a.js' }))
+    }
+    if ((turn.tools ?? 0) === 0) state = projection.apply(state, assistant('继续。'))
+    state = projection.apply(state, turnEnd())
+    state = projection.apply(state, step())
+  }
+  return { state, projection, host }
+}
+
+await check('stall: a turn that used tools resets the counter', async () => {
+  const { state } = stallAfter([{ tools: 0 }, { tools: 1 }])
+  assert.equal(state.stalledTurns, 0, 'using a tool is progress and clears the streak')
+})
+await check('stall: two tool-free turn endings in a row are counted', async () => {
+  const { state } = stallAfter([{ tools: 0 }, { tools: 0 }])
+  assert.equal(state.stalledTurns, 2, 'the streak is the number of bare endings')
+})
+await check('stall: the streak keeps growing across many bare turns', async () => {
+  const { state } = stallAfter([{ tools: 0 }, { tools: 0 }, { tools: 0 }, { tools: 0 }])
+  assert.equal(state.stalledTurns, 4, 'a long stall stays visible instead of resetting')
+})
+await check('stall: a single bare turn is not yet a stall', async () => {
+  const { state } = stallAfter([{ tools: 0 }])
+  assert.equal(state.stalledTurns, 1, 'one bare ending is a normal reply, not a loop')
+})
+await check('stall: the counter survives only within one request', async () => {
+  const roots = []
+  const host = fakeHost(roots)
+  apply(host.ctx, {})
+  const projection = host.projectionOf()
+  let state = projection.init()
+  state = projection.apply(state, turnStart())
+  state = projection.apply(state, assistant('继续。'))
+  state = projection.apply(state, turnEnd())
+  state = projection.apply(state, step())
+  state = projection.apply(state, turnStart())
+  state = projection.apply(state, assistant('继续。'))
+  state = projection.apply(state, turnEnd())
+  state = projection.apply(state, step())
+  assert.equal(state.stalledTurns, 2, 'two bare endings in the same request')
+  // A fresh human request is a new request: the streak belongs to the one before.
+  state = projection.apply(state, human('Do something else.'))
+  assert.equal(state.stalledTurns, 0, 'a new request does not inherit the old streak')
+})
+
+/** Drive N bare turns, then ask the turn-stopper what it says. */
+function stallSteer(turns, { finalTools = 0 } = {}) {
+  const roots = []
+  const host = fakeHost(roots)
+  apply(host.ctx, { blockUnfinished: false })
+  const projection = host.projectionOf()
+  let state = projection.init()
+  for (const tools of turns) {
+    state = projection.apply(state, turnStart())
+    for (let i = 0; i < tools; i++) state = projection.apply(state, toolCall('read', { file_path: '/repo/a.js' }))
+    if (tools === 0) state = projection.apply(state, assistant('继续。'))
+    state = projection.apply(state, turnEnd())
+  }
+  state = projection.apply(state, turnStart())
+  for (let i = 0; i < finalTools; i++) state = projection.apply(state, toolCall('read', { file_path: '/repo/a.js' }))
+  const session = { __state: state, snapshotEvents: () => [] }
+  const agent = { session, id: 'a' }
+  roots.push(agent)
+  const steered = []
+  agent.steer = message => { steered.push(message) }
+  const stopping = host.registered.listeners.get('agent/turn-stopping')[0]
+  try {
+    stopping({ agent })
+    stopping({ agent })
+  } finally {
+    delete agent.steer
+  }
+  const texts = steered.map(m => m.content[0].text)
+  return {
+    steered,
+    texts,
+    directive: texts.filter(t => t.includes('without calling a single tool')),
+    escalation: texts.filter(t => t.includes('escalating')),
+  }
+}
+
+await check('stall: a turn that used tools is left alone entirely', async () => {
+  const { steered } = await stallSteer([[1]], { finalTools: 1 })
+  assert.equal(steered.length, 0, 'real work is never interrupted')
+})
+await check('stall: one bare turn is still left alone', async () => {
+  const { directive, escalation } = await stallSteer([[0]])
+  assert.equal(directive.length, 0, 'a single bare reply is a normal ending')
+  assert.equal(escalation.length, 0, 'and certainly not an escalation')
+})
+await check('stall: two bare turns get a concrete directive, not another acknowledgement', async () => {
+  const { directive, escalation } = await stallSteer([[0], [0]])
+  assert.equal(directive.length, 1, 'the streak is named and two ways out are offered')
+  assert.equal(escalation.length, 0, 'escalation comes later')
+  assert.match(directive[0], /call a tool and do one concrete thing/)
+  assert.match(directive[0], /state plainly what is blocking you/)
+  assert.match(directive[0], /Do not reply with another acknowledgement/)
+})
+await check('stall: the directive is issued once, not until complied with', async () => {
+  const { directive } = await stallSteer([[0], [0]])
+  assert.equal(directive.length, 1, 'asking twice would just join the loop')
+})
+await check('stall: four bare turns escalate to the user instead of looping', async () => {
+  const { directive, escalation } = await stallSteer([[0], [0], [0], [0]])
+  assert.equal(escalation.length, 1, 'the human is told, once')
+  assert.equal(directive.length, 0, 'the guard stops asking at that point')
+  assert.match(escalation[0], /no re-sampling, no logit/)
+  assert.match(escalation[0], /a sampling problem, not a drift problem/)
+})
+await check('stall: using a tool mid-streak clears it', async () => {
+  const { directive, escalation } = await stallSteer([[0], [1]])
+  assert.equal(directive.length, 0, 'the streak was broken by real work')
+  assert.equal(escalation.length, 0, 'nothing to escalate')
+})
+
 // ==================================================================== report ==
 
 if (failures.length > 0) {

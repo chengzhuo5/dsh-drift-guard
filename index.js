@@ -502,6 +502,10 @@ function initialState() {
     mutationRatio: 0,
     /** Closed steps taken within the current request, reset by a new baseline. */
     stepsThisTurn: 0,
+  /** Tool calls made in the turn in progress. Resets the stall streak when > 0. */
+  toolsThisTurn: 0,
+  /** Consecutive turn endings that used no tool at all. Cleared by any tool call. */
+  stalledTurns: 0,
     /**
      * The turn key the guard itself asked for a contract in. `null` means it
      * has not asked yet; recording the key keeps the ask one-shot WITHOUT
@@ -606,6 +610,8 @@ function parseState(value) {
     turn: count(raw.turn, 0),
     mutationRatio: Number.isFinite(raw.mutationRatio) && raw.mutationRatio >= 0 ? raw.mutationRatio : 0,
     stepsThisTurn: count(raw.stepsThisTurn, 0),
+    toolsThisTurn: count(raw.toolsThisTurn, 0),
+    stalledTurns: count(raw.stalledTurns, 0),
     askedAnchorAtTurn: Number.isFinite(raw.askedAnchorAtTurn) ? raw.askedAnchorAtTurn : null,
   }
 }
@@ -747,6 +753,8 @@ function projectionDefinition(options = {}) {
     apply: (state, event) => {
       switch (event.type) {
         case 'user/message': {
+          // A stall streak belongs to the request it happened in.
+          if (event.data?.source?.kind === 'user') state = { ...state, stalledTurns: 0 }
           // The guard's own ask for a contract is recorded so it happens once
           // per request rather than once per step.
           if (event.data?.source?.kind === name) {
@@ -780,6 +788,16 @@ function projectionDefinition(options = {}) {
             deferralSeq: null,
             stepsThisTurn: 0,
           }
+        }
+        case 'turn/start': {
+          return { ...state, toolsThisTurn: 0 }
+        }
+        case 'turn/end': {
+          // The turn is over. A turn that called no tool at all is a bare ending;
+          // any tool call clears the streak, so ordinary concluding turns - which
+          // always followed real work - never count.
+          if (state.toolsThisTurn > 0) return { ...state, stalledTurns: 0 }
+          return { ...state, stalledTurns: state.stalledTurns + 1 }
         }
         case 'step/start':
           return {
@@ -817,6 +835,9 @@ function projectionDefinition(options = {}) {
           return { ...state, deferrals: merged, deferralSeq: event.seq }
         }
         case 'tool/call': {
+          // Counted before any filtering: what matters is that a tool ran, not
+          // which one. A guard tool call is still the agent doing something.
+          state = { ...state, toolsThisTurn: state.toolsThisTurn + 1, stalledTurns: 0 }
           const name = event.data?.name
           if (name !== ANCHOR_TOOL && name !== DRIFT_TOOL) return state
           const args = argsOf(event)
@@ -1111,6 +1132,48 @@ function renderUnfinished(state) {
     '3. Stop and report the incomplete state plainly. Do not describe a partial delivery as finished, and do not rename the remaining work as a follow-up you decided on your own.',
   )
   return lines.join('\n')
+}
+
+/**
+ * Replace a bare continuation with something actionable.
+ *
+ * The loop's fuel is the auto-continuation arriving as a bare "continue", which the
+ * agent answers with another bare "continue". The guard cannot change how that prompt is
+ * generated, but it can put an instruction in front of it that names two concrete ways
+ * out, so the next reply has something to act on.
+ */
+function renderStallDirective(stalled) {
+  return [
+    `drift-guard: ${stalled} turns in a row have ended without calling a single tool.`,
+    '',
+    'Saying you will continue is not continuing. Right now, do ONE of these:',
+    '- call a tool and do one concrete thing, or',
+    '- state plainly what is blocking you, and stop.',
+    '',
+    'Do not reply with another acknowledgement. A turn that ends without a tool call and',
+    'without naming a blocker is the loop this message exists to break.',
+  ].join('\n')
+}
+
+/**
+ * Stop looping and hand the stall to the human.
+ *
+ * After this many bare turns the guard's own instruction has already failed to break the
+ * cycle. Re-issuing it would just add the guard to the loop, so it reports once and stops:
+ * the human can decide what the model cannot.
+ */
+function renderStallEscalation(stalled) {
+  return [
+    `drift-guard: escalating - ${stalled} consecutive turns ended with no tool call.`,
+    '',
+    'The guard already asked for a concrete action and it did not break the cycle, so it is',
+    'not going to keep asking. This is reported rather than repeated.',
+    '',
+    'What the guard cannot do, and will not pretend to: it has no re-sampling, no logit',
+    'handling and no stop-sequence control, so a degenerate token-level loop is beyond it.',
+    'What it can tell you is the mechanical fact above. If the replies look like nonsense',
+    'rather than like stalling, that is a sampling problem, not a drift problem.',
+  ].join('\n')
 }
 
 /**
@@ -2067,6 +2130,10 @@ export function apply(ctx, config) {
   const REPEAT_WRITE_LIMIT = 3
   /** Steps after which an unfinished turn is worth recording something about. */
   const LONG_TURN_LIMIT = 20
+  /** Consecutive tool-free turn endings before the guard supplies a real instruction. */
+  const STALL_INTERVENE_AT = 2
+  /** ...and before it stops looping and hands the stall to the human instead. */
+  const STALL_ESCALATE_AT = 4
 
   /**
    * Which lesson triggers this turn's own mechanics justify.
@@ -2213,6 +2280,28 @@ export function apply(ctx, config) {
     const steers = sameRequest ? entry.steers : 0
     if (steers >= resolved.maxCheckpointsPerTurn) return
     const spend = { turnKey: state.turnKey, contractSeq: state.contractSeq, atStep: entry.atStep, messages: entry.messages }
+
+    // A run of turns that ended without using a tool at all. Measured on 194 real
+    // logs: 278 such turn endings, longest run 157, driven by the bare
+    // auto-continuation re-arming. The guard cannot stop that re-arming, but it can
+    // make sure the next continuation carries something actionable rather than
+    // being answered with another "继续。". Any tool call clears the streak, so a
+    // normal concluding turn - which always followed real work - never trips this.
+    // Checked BEFORE the contract-shaped gates below: stalling is orthogonal to
+    // contracts, and it is most likely exactly when there is no contract at all.
+    const stalled = Number.isFinite(state.stalledTurns) ? state.stalledTurns : 0
+    if (stalled >= STALL_ESCALATE_AT) {
+      if (entry.stallEscalated === true) return
+      memory.set(agent, { ...spend, steers: steers + 1, stallEscalated: true })
+      steer(agent, renderStallEscalation(stalled))
+      return
+    }
+    if (stalled >= STALL_INTERVENE_AT) {
+      if (entry.stallIntervened === true) return
+      memory.set(agent, { ...spend, steers: steers + 1, stallIntervened: true })
+      steer(agent, renderStallDirective(stalled))
+      return
+    }
 
     // Completeness first: an unfinished must-deliver item is the more specific
     // and more serious finding, so it wins the one steer this turn allows.
