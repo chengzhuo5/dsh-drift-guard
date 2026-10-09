@@ -1,0 +1,22 @@
+{
+  "outside": "13d7793c1c8772dd13a91645e72837c00927b1a3a0a23cc9842627cc478a38c1",
+  "policyKeys": {
+    "stepBudget": 30,
+    "maxCheckpointsPerTurn": 2,
+    "maxCheckpointMessages": 3,
+    "askAnchorAt": 2,
+    "reportDeferrals": false,
+    "mutationBudget": 0.5
+  },
+  "functions": {
+    "citedBasis": "f69d3fc72c89ec87820dfbc0e89793f13a38bffb266eaa37fed6613718006309",
+    "autoResolution": "b0d6ffffa81fd86a278d9364b101758116f1d149a13b9febd4f3a4db6dd1f795",
+    "derivePosture": "11817113f0549d922a06fb5f84f2865ce4a225047b668139d24e44aff05f146c",
+    "unfinishedItems": "150899c4d50282e2d355a178f493e8bacadefd316fd957aadb0afff149b2bf48",
+    "renderContract": "9c88588a6fb6367d06ab4221b723b9e381f29452d27210a87503b145c8b1144c",
+    "renderBaseline": "6b8582846372c4b5b430373ab56c80bc62f66929c2c219273677cfdc18b0caab",
+    "validateDriftArgs": "5713f7a296aad43eb3463d05553777b8244e4385f0dabd321e90ce2f4565531e",
+    "validateAnchorArgs": "6f50c8e611a64ec8616244b0214fa02f4738dda5a8c0cc324e49ddc186efae9f"
+  },
+  "mutationCaught": 4
+}

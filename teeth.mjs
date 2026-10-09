@@ -1,10 +1,18 @@
 // Throwaway: mutation checks for the three live-run fixes, using plain substring
 // needles so indentation differences cannot silently skip a mutation.
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 
 const FILE = 'index.js'
+const LOCK = '.mutation-lock'
 const original = readFileSync(FILE, 'utf8')
+
+// This harness REWRITES index.js for the duration of each mutation. Any other
+// test running meanwhile would read a deliberately broken source and fail for a
+// reason that has nothing to do with the code under test. Hold a lock across the
+// whole window; check.mjs refuses to start while it exists.
+writeFileSync(LOCK, String(process.pid))
+process.on('exit', () => { try { unlinkSync(LOCK) } catch {} })
 
 const MUTATIONS = [
   {
@@ -73,7 +81,7 @@ for (const mutation of MUTATIONS) {
   const wrote = onDisk !== original
   let output = ''
   try {
-    output = execFileSync('node', ['check.mjs'], { encoding: 'utf8' })
+    output = execFileSync('node', ['check.mjs'], { encoding: 'utf8', env: { ...process.env, DSH_ALLOW_MUTATION_LOCK: '1' } })
   } catch (error) {
     output = `${error.stdout ?? ''}${error.stderr ?? ''}`
   }
@@ -87,5 +95,6 @@ for (const mutation of MUTATIONS) {
 }
 
 writeFileSync(FILE, original)
-const final = execFileSync('node', ['check.mjs'], { encoding: 'utf8' })
+try { unlinkSync(LOCK) } catch {}
+const final = execFileSync('node', ['check.mjs'], { encoding: 'utf8', env: { ...process.env, DSH_ALLOW_MUTATION_LOCK: '1' } })
 console.log(`\nrestored: ${final.trim().split('\n').at(-1)}`)

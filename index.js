@@ -134,8 +134,41 @@ const REJECT_LABEL = DEFAULT_DRIFT_OPTIONS[1].label
 /** Coverage verdicts for one must-deliver item. */
 const COVERAGE_STATES = ['complete', 'partial', 'missing', 'waived']
 
+// ============================ RSI SELF-TUNABLE POLICY (BEGIN) ================
+// The ONLY region a self-improvement loop is allowed to rewrite. Everything in
+// here is a THRESHOLD OR A FLAG: a number or boolean that changes behaviour
+// without changing the meaning of the mechanism. That restriction is what makes
+// self-modification auditable - the guard can tune its own sensitivity, but it
+// can never redefine what counts as drift, weaken a gate, or touch the ledger.
+//
+// Enforcement lives in rsi.mjs and core.json:
+//   - core.json pins the SHA-256 of every mechanism function below.
+//   - The file outside this region is hashed too, so nothing else may move.
+//   - An edit that changes any pinned hash is REJECTED, not warned about.
+const POLICY = {
+  stepBudget: 30,
+  maxCheckpointsPerTurn: 2,
+  maxCheckpointMessages: 3,
+  askAnchorAt: 2,
+  reportDeferrals: false,
+  mutationBudget: 0.5,
+}
+// ============================= RSI SELF-TUNABLE POLICY (END) =================
+
 /** The verdicts that mean "a human agreed to ship without this". */
 const AUTHORIZED_VERDICTS = ['complete', 'waived']
+
+/** Mechanism functions a self-improvement loop must never rewrite. */
+const FROZEN_CORE_NAMES = [
+  'citedBasis',
+  'autoResolution',
+  'derivePosture',
+  'unfinishedItems',
+  'renderContract',
+  'renderBaseline',
+  'validateDriftArgs',
+  'validateAnchorArgs',
+]
 
 /**
  * Reasons whose automatic resolution is a scope REDUCTION. Never self-approved,
@@ -274,15 +307,15 @@ const WORK_VERBS = /(?:\b(?:implement(?:ed|ing|s)?|built|build(?:ing)?|wrote|wri
 export function resolveConfig(config) {
   const raw = config ?? {}
   const resolved = {
-    stepBudget: raw.stepBudget ?? DEFAULT_STEP_BUDGET,
-    maxCheckpointsPerTurn: raw.maxCheckpointsPerTurn ?? DEFAULT_MAX_CHECKPOINTS_PER_TURN,
-    maxCheckpointMessages: raw.maxCheckpointMessages ?? DEFAULT_MAX_CHECKPOINT_MESSAGES,
-    askAnchorAt: raw.askAnchorAt ?? DEFAULT_ASK_ANCHOR_AT,
+    stepBudget: raw.stepBudget ?? POLICY.stepBudget,
+    maxCheckpointsPerTurn: raw.maxCheckpointsPerTurn ?? POLICY.maxCheckpointsPerTurn,
+    maxCheckpointMessages: raw.maxCheckpointMessages ?? POLICY.maxCheckpointMessages,
+    askAnchorAt: raw.askAnchorAt ?? POLICY.askAnchorAt,
     requireCoverage: raw.requireCoverage ?? true,
     blockUnfinished: raw.blockUnfinished ?? true,
-    reportDeferrals: raw.reportDeferrals ?? false,
+    reportDeferrals: raw.reportDeferrals ?? POLICY.reportDeferrals,
     autoDrift: raw.autoDrift ?? true,
-    mutationBudget: raw.mutationBudget ?? DEFAULT_MUTATION_BUDGET,
+    mutationBudget: raw.mutationBudget ?? POLICY.mutationBudget,
   }
   for (const key of ['stepBudget', 'askAnchorAt']) {
     const value = resolved[key]
@@ -1486,6 +1519,8 @@ export {
   deferralMarkers,
   parseState,
   anchorValue,
+  POLICY,
+  FROZEN_CORE_NAMES,
 }
 
 /**

@@ -38,14 +38,21 @@ const check = async (label, fn) => {
 
 // ===================================================================== config ==
 
-await check('config defaults resolve', () => {
+await check('config defaults resolve to a usable, non-bypassing configuration', () => {
+  // Deliberately NOT pinned to literal values. The thresholds live in the marked
+  // POLICY region of index.js and a self-improvement loop may tune them, so
+  // asserting the numbers would fail every candidate and freeze the policy
+  // forever. What must hold is the shape and the safety-relevant invariants:
+  // nothing that switches a gate off may become the default.
   const resolved = resolveConfig(undefined)
-  assert.equal(resolved.stepBudget, 30)
-  assert.equal(resolved.maxCheckpointsPerTurn, 2)
-  assert.equal(resolved.maxCheckpointMessages, 3)
-  assert.equal(resolved.askAnchorAt, 2)
-  assert.equal(resolved.requireCoverage, true)
-  assert.equal(resolved.blockUnfinished, true)
+  assert.ok(Number.isSafeInteger(resolved.stepBudget) && resolved.stepBudget >= 1, 'stepBudget is a positive integer')
+  assert.ok(Number.isSafeInteger(resolved.askAnchorAt) && resolved.askAnchorAt >= 1, 'askAnchorAt is a positive integer')
+  assert.ok(Number.isSafeInteger(resolved.maxCheckpointsPerTurn) && resolved.maxCheckpointsPerTurn >= 0)
+  assert.ok(Number.isSafeInteger(resolved.maxCheckpointMessages) && resolved.maxCheckpointMessages >= 0)
+  assert.equal(resolved.requireCoverage, true, 'coverage must be required by default')
+  assert.equal(resolved.blockUnfinished, true, 'the completeness gate must be on by default')
+  assert.equal(resolved.autoDrift, true)
+  assert.ok(resolved.mutationBudget > 0 && resolved.mutationBudget <= 1, 'the drift budget is a ratio')
 })
 await check('config rejects a zero step budget', () => {
   assert.throws(() => resolveConfig({ stepBudget: 0 }), /stepBudget/)
