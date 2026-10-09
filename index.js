@@ -49,6 +49,12 @@ const PROJECTION_KEY = 'driftGuard'
 /** Model-facing contract tool. */
 const ANCHOR_TOOL = 'drift_anchor'
 
+/** Model-facing tool that records a cross-session lesson. */
+const LESSON_TOOL = 'drift_lesson'
+
+/** Model-facing read-only view of the stored lessons. */
+const LESSONS_TOOL = 'drift_lessons'
+
 /** Model-facing direction-change tool. */
 const DRIFT_TOOL = 'drift_report'
 
@@ -90,6 +96,19 @@ const USAGE_VALUE_SCHEMA = {
 const DEFAULT_ASK_ANCHOR_AT = 2
 
 /** Plugin name, tool source kind, and prompt-section prefix. */
+import {
+  LESSONS_FILE,
+  LESSON_TRIGGERS,
+  LESSON_TRIGGER_NAMES,
+  activeLessons,
+  lessonsForTriggers,
+  loadLessons,
+  recordLesson,
+  renderLessons,
+  renderReminder,
+  triggersForCall,
+} from './lessons.js'
+
 export const name = 'drift-guard'
 
 /**
@@ -316,6 +335,9 @@ export function resolveConfig(config) {
     reportDeferrals: raw.reportDeferrals ?? POLICY.reportDeferrals,
     autoDrift: raw.autoDrift ?? true,
     mutationBudget: raw.mutationBudget ?? POLICY.mutationBudget,
+    // Where cross-session lessons live. Defaults to the working directory, which
+    // is where a human would look for it.
+    lessonsFile: raw.lessonsFile ?? LESSONS_FILE,
   }
   for (const key of ['stepBudget', 'askAnchorAt']) {
     const value = resolved[key]
@@ -333,6 +355,9 @@ export function resolveConfig(config) {
     if (typeof resolved[key] !== 'boolean') {
       throw new Error(`drift-guard: ${key} must be a boolean, got ${typeof resolved[key]}`)
     }
+  }
+  if (typeof resolved.lessonsFile !== 'string' || resolved.lessonsFile.length === 0) {
+    throw new Error('drift-guard: lessonsFile must be a non-empty path')
   }
   return resolved
 }
@@ -439,6 +464,15 @@ function emptyContract() {
 /** The all-zero projection state. */
 function initialState() {
   return {
+    /**
+     * Cross-session lessons, read once when the session's projection is created
+     * and then held. `lessonsText` is rendered at the SAME moment and never
+     * recomputed, which is what keeps the injected bytes identical for the whole
+     * session: it sits at the front of every request, and a value that moved would
+     * invalidate the provider's cached prompt prefix on every step.
+     */
+    lessons: [],
+    lessonsText: '',
     baseline: null,
     baselineSeq: null,
     /**
@@ -529,6 +563,10 @@ function parseState(value) {
   const candidateDrift = raw.drift
   const candidateDecision = raw.decision
   return {
+    // Kept verbatim across a persistence round-trip: the rendered text is what was
+    // injected, and re-rendering it later could produce different bytes.
+    lessons: Array.isArray(raw.lessons) ? raw.lessons : [],
+    lessonsText: typeof raw.lessonsText === 'string' ? raw.lessonsText : '',
     baseline,
     baselineSeq: Number.isFinite(raw.baselineSeq) ? raw.baselineSeq : null,
     turnKey: Number.isFinite(raw.turnKey) ? raw.turnKey : null,
@@ -689,7 +727,23 @@ function projectionDefinition(options = {}) {
     key: PROJECTION_KEY,
     stateVersion: 1,
     stateSchema: { parse: parseState },
-    init: () => initialState(),
+    init: () => {
+      // Lessons are read and rendered ONCE here, at projection creation, and the
+      // resulting text is held for the session. Recomputing it later would move
+      // bytes at the front of every request, which is exactly what invalidates a
+      // cached prompt prefix.
+      const base = initialState()
+      if (typeof options.loadLessons !== 'function') return base
+      try {
+        const lessons = activeLessons(options.loadLessons())
+        return { ...base, lessons, lessonsText: renderLessons(lessons) }
+      } catch {
+        // A malformed store must not take the guard down with it. The tools report
+        // the real error when someone tries to write; until then the session runs
+        // exactly as it would with no lessons at all.
+        return base
+      }
+    },
     apply: (state, event) => {
       switch (event.type) {
         case 'user/message': {
@@ -1531,7 +1585,12 @@ export {
 export function apply(ctx, config) {
   const resolved = resolveConfig(config)
 
-  ctx.sessionProjections.register(projectionDefinition({ reportDeferrals: resolved.reportDeferrals }))
+  ctx.sessionProjections.register(projectionDefinition({
+    reportDeferrals: resolved.reportDeferrals,
+    // Bound here rather than read inside the projection, so the projection stays a
+    // pure fold: the store's location is configuration, not fold logic.
+    loadLessons: () => loadLessons(resolved.lessonsFile),
+  }))
 
   // Static policy: identical for every request, so it stays a stable prompt
   // prefix and never invalidates a reusable cache entry.
@@ -1591,12 +1650,16 @@ export function apply(ctx, config) {
       const agent = assemble?.scope
       if (agent?.session === undefined) return ''
       const state = stateOf(ctx, agent)
-      // Nothing occupancy-related is injected here, on purpose: a value that
-      // changes would sit at the front of the request and invalidate the
-      // provider's cached prompt prefix. Read it with USAGE_TOOL instead.
       if (state === undefined) return ''
-      if (state.baseline === null && state.contract === null) return ''
       const parts = []
+      // Lessons come first and are already rendered, so their bytes are the same
+      // at every step of the session. Nothing occupancy-related is injected here,
+      // on purpose: a value that moved would invalidate the provider's cached
+      // prompt prefix. Read occupancy with USAGE_TOOL instead.
+      if (typeof state.lessonsText === 'string' && state.lessonsText.length > 0) {
+        parts.push(state.lessonsText)
+      }
+      if (state.baseline === null && state.contract === null) return parts.join('\n\n')
       if (state.baseline !== null) parts.push(renderBaseline(state.baseline))
       parts.push(renderContract(state, resolved.stepBudget))
       return parts.join('\n\n')
@@ -1834,6 +1897,116 @@ export function apply(ctx, config) {
     },
   })
   /**
+   * Record a lesson. This is how the guard stops re-learning the same thing every
+   * session: the entry outlives the session that produced it.
+   */
+  ctx.tools.register({
+    name: LESSON_TOOL,
+    description: 'Record a LESSON so it survives this session: a mistake that was actually made, or a practice that actually worked, plus the situation that should bring it back. The store is append-only - a wrong lesson is retired by recording a later one that supersedes it, never by editing or deleting. Use this the moment you notice you repeated a mistake, or found a way of working worth repeating. Triggers are a closed list; pick the one naming the situation, do not invent one.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['symptom', 'rule', 'trigger'],
+      properties: {
+        symptom: { type: 'string', description: 'What actually went wrong (or right), concretely enough that a future reader recognises it happening again.' },
+        rule: { type: 'string', description: 'What to do instead, written as an instruction to a future self.' },
+        trigger: {
+          type: 'string',
+          enum: LESSON_TRIGGER_NAMES,
+          description: Object.entries(LESSON_TRIGGERS).map(([key, text]) => key + ': ' + text).join(' | '),
+        },
+        trigger_note: { type: 'string', description: 'Optional: anything the trigger name does not capture about when this applies.' },
+        supersedes: { type: 'string', description: 'Optional: the id of an earlier lesson this one replaces. The old entry stays in the store, marked superseded, so text already injected elsewhere does not move.' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'trigger', 'stored', 'note'],
+        properties: {
+          id: { type: 'string' },
+          trigger: { type: 'string' },
+          stored: { type: 'number', description: 'How many lessons the store now holds in total.' },
+          note: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    presentCall: () => ({ card: 'generic', title: 'Record a lesson', kind: 'other' }),
+    async execute(args, exec) {
+      const agent = exec.agent
+      if (agent === undefined) throw new Error(`${LESSON_TOOL} requires a calling agent`)
+      if (!isRootAgent(ctx, agent)) throw delegatedRefusal(LESSON_TOOL)
+      const record = recordLesson(resolved.lessonsFile, args, Date.now())
+      const total = loadLessons(resolved.lessonsFile).lessons.length
+      return {
+        id: String(record.id),
+        trigger: String(record.trigger),
+        stored: total,
+        note: 'Recorded. It is injected at the start of FUTURE sessions, not this one: the injected block '
+          + 'is rendered once per session and held, so the prompt prefix stays byte-identical and a cached '
+          + 'prefix is not invalidated mid-conversation.',
+      }
+    },
+  })
+
+  /** Read the stored lessons without changing anything. */
+  ctx.tools.register({
+    name: LESSONS_TOOL,
+    description: 'Read the stored cross-session lessons, including which are still active and which a later entry has superseded. Read-only, no arguments.',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['total', 'active', 'triggers', 'lessons'],
+        properties: {
+          total: { type: 'number' },
+          active: { type: 'number' },
+          triggers: { type: 'string', description: 'The closed set of trigger names.' },
+          lessons: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['id', 'trigger', 'symptom', 'rule', 'active'],
+              properties: {
+                id: { type: 'string' },
+                trigger: { type: 'string' },
+                symptom: { type: 'string' },
+                rule: { type: 'string' },
+                active: { type: 'boolean', description: 'False once a later lesson supersedes it. Superseded entries are kept so injected text never has to move.' },
+                supersededBy: { type: 'string' },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    presentCall: () => ({ card: 'generic', title: 'Read stored lessons', kind: 'read' }),
+    isReadOnly: () => true,
+    async execute() {
+      const store = loadLessons(resolved.lessonsFile)
+      const active = new Set(activeLessons(store).map(lesson => lesson.id))
+      return {
+        total: store.lessons.length,
+        active: active.size,
+        triggers: LESSON_TRIGGER_NAMES.join(', '),
+        lessons: store.lessons.map(lesson => ({
+          id: String(lesson.id),
+          trigger: String(lesson.trigger),
+          symptom: String(lesson.symptom),
+          rule: String(lesson.rule),
+          active: active.has(lesson.id),
+          ...lesson.supersededBy === undefined ? {} : { supersededBy: String(lesson.supersededBy) },
+        })),
+      }
+    },
+  })
+
+  /**
    * Per-agent guard memory: checkpoint dedupe within a turn, the forced-steer
    * count, and the lifetime message ceiling. Plugin memory is a derived cache —
    * the durable facts live in the projection.
@@ -1845,13 +2018,50 @@ export function apply(ctx, config) {
     return memory.get(agent) ?? { turnKey: null, contractSeq: null, atStep: -1, messages: 0, steers: 0 }
   }
 
+  /**
+   * Raise a stored lesson when the call in front of us matches its trigger.
+   *
+   * Deliberately NOT a gate: it adds a message and never blocks. The user chose a
+   * reminder over enforcement, and a reminder that halts work would be a gate
+   * wearing a reminder's name.
+   *
+   * Each lesson is raised at most once per agent, because a reminder that repeats
+   * on every matching call is noise, and noise is what teaches a reader to ignore
+   * reminders.
+   */
+  function lessonReminder(ctx2, exec, entryFor2) {
+    const agent = exec?.agent
+    if (agent === undefined || agent.session === undefined) return undefined
+    const state = stateOf(ctx2, agent)
+    if (state === undefined || !Array.isArray(state.lessons) || state.lessons.length === 0) return undefined
+    const args = argsOf(exec) ?? {}
+    const fired = triggersForCall(exec.name, args, state)
+    const due = lessonsForTriggers(state.lessons, fired)
+    if (due.length === 0) return undefined
+    const entry = entryFor2(agent)
+    const raised = entry.lessonsRaised ?? new Set()
+    const fresh = due.filter(lesson => !raised.has(lesson.id))
+    if (fresh.length === 0) return undefined
+    const next = new Set(raised)
+    for (const lesson of fresh) next.add(lesson.id)
+    memory.set(agent, { ...entry, lessonsRaised: next })
+    const trigger = [...fired].find(name => fresh.some(lesson => lesson.trigger === name)) ?? fresh[0].trigger
+    return contextMessage(
+      fresh.map(lesson => renderReminder(lesson, lesson.trigger)).join('\n\n'),
+      'notice',
+      `lesson(s) ${fresh.map(lesson => lesson.id).join(',')} matched ${trigger}`,
+    )
+  }
+
   // Enrich, never veto. Post-execute sees every accepted call, including ones a
   // later listener denies, so the checkpoint cannot be starved by policy.
   ctx.on('tools/post-execute', async (exec, _result, next) => {
     const message = budgetCheckpoint(ctx, resolved, exec, memory, entryFor)
+    const lesson = lessonReminder(ctx, exec, entryFor)
     const downstream = await next()
-    if (message === undefined) return downstream
-    const additionalContexts = [message, ...downstream.additionalContexts ?? []]
+    const prepend = [message, lesson].filter(entry => entry !== undefined)
+    if (prepend.length === 0) return downstream
+    const additionalContexts = [...prepend, ...downstream.additionalContexts ?? []]
     if (downstream.kind === 'block') {
       return { kind: 'block', feedback: downstream.feedback, additionalContexts }
     }

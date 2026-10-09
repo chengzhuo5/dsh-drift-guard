@@ -12,6 +12,9 @@
  */
 
 import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import {
   apply,
   resolveConfig,
@@ -594,9 +597,10 @@ await check('answer mapping: an unknown label throws instead of recording a reje
 
 // ================================================================== the tools ==
 
-await check('the plugin registers three tools, one section, one context, two listeners', () => {
+await check('the plugin registers five tools, one section, one context, two listeners', () => {
   const { host } = mount()
-  assert.deepEqual(host.registered.tools.map(t => t.name).sort(), ['drift_anchor', 'drift_context_usage', 'drift_report'])
+  assert.deepEqual(host.registered.tools.map(t => t.name).sort(),
+    ['drift_anchor', 'drift_context_usage', 'drift_lesson', 'drift_lessons', 'drift_report'])
   assert.equal(host.registered.sections.length, 1)
   assert.equal(host.registered.contexts.length, 1)
   assert.equal(host.registered.listeners.get('tools/post-execute').length, 1)
@@ -1324,6 +1328,167 @@ await check('usage: the prompt carries NO occupancy text, so the prefix stays st
   assert.equal(text.includes('Context usage'), false)
   assert.equal(text.includes('85.0k'), false)
   assert.equal(text.includes('WARNING'), false)
+})
+
+// ============================================= cross-session lessons ====
+// The lesson block sits at the very front of every request, so the property that
+// matters most is that its bytes do not move inside one session: a changing prefix
+// invalidates the provider's cached prompt prefix.
+
+/** Mount with a lesson store already written to a temporary file. */
+function mountWithLessons(lessons, config = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'drift-lessons-'))
+  const file = join(dir, 'lessons.json')
+  writeFileSync(file, JSON.stringify({ version: 1, lessons }, null, 2))
+  const roots = []
+  const host = fakeHost(roots)
+  apply(host.ctx, { lessonsFile: file, ...config })
+  return { host, file, dir, roots }
+}
+
+const sampleLesson = (extra = {}) => ({
+  id: 'L1',
+  at: 1,
+  symptom: 'Edited a test file until it agreed with the code.',
+  rule: 'Change the code, not the test, unless the test itself was wrong.',
+  trigger: 'before-editing-tests',
+  ...extra,
+})
+
+/** A session whose projection has already been initialised from the store. */
+function lessonSession(host, roots, events) {
+  const projection = host.projectionOf()
+  let state = projection.init()
+  for (const event of events) state = projection.apply(state, event)
+  const session = { __state: state, snapshotEvents: () => [] }
+  const agent = { session, id: 'a' }
+  roots.push(agent)
+  return { agent, session, projection }
+}
+
+await check('lessons: stored lessons are injected at the front of the prompt', () => {
+  const { host, roots, dir } = mountWithLessons([sampleLesson()])
+  try {
+    const { agent } = lessonSession(host, roots, [])
+    const provider = host.registered.contexts.find(entry => entry.name === 'drift-guard')
+    const text = provider.text({ scope: agent })
+    assert.match(text, /Lessons from earlier sessions/)
+    assert.match(text, /L1/)
+    assert.match(text, /Change the code, not the test/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+await check('lessons: the injected block is byte-identical across steps of one session', () => {
+  const { host, roots, dir } = mountWithLessons([sampleLesson()])
+  try {
+    const { agent, session, projection } = lessonSession(host, roots, [turnStart(), human('Fix the parser.'), step()])
+    const provider = host.registered.contexts.find(entry => entry.name === 'drift-guard')
+    const first = provider.text({ scope: agent })
+    assert.ok(first.includes('**L1**'), 'the lesson block is present before any further steps')
+
+    let moved = session.__state
+    for (const event of [step(), step(), turnEnd(), turnStart(2), human('and again', 2), step(2)]) {
+      moved = projection.apply(moved, event)
+    }
+    session.__state = moved
+    const later = provider.text({ scope: agent })
+
+    // The lesson block is prepended, so it is the PREFIX of both renders. Taking
+    // the same number of leading characters from each is a comparison with no
+    // assumption about how the rest of the context is formatted.
+    const prefix = first.slice(0, first.indexOf('**L1**') + 200)
+    assert.ok(prefix.startsWith('## Lessons from earlier sessions'), 'lessons come first')
+    assert.ok(later.startsWith(prefix), 'the same leading bytes are still there, unmoved')
+
+    // And the lesson line itself is byte-identical, end to end.
+    const lessonLine = text => text.split('\n').find(line => line.includes('**L1**')) ?? ''
+    assert.equal(lessonLine(first), lessonLine(later), 'the injected lesson line did not move')
+    assert.match(first, /Change the code, not the test/, 'both symptom and rule are rendered')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+await check('lessons: no lessons means nothing injected, not an empty header', () => {
+  const { host, roots, dir } = mountWithLessons([])
+  try {
+    const { agent } = lessonSession(host, roots, [])
+    const provider = host.registered.contexts.find(entry => entry.name === 'drift-guard')
+    assert.equal(provider.text({ scope: agent }).includes('Lessons from earlier sessions'), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+await check('lessons: a malformed store does not take the guard down', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'drift-bad-'))
+  const file = join(dir, 'lessons.json')
+  writeFileSync(file, '{ this is not json')
+  const roots = []
+  const host = fakeHost(roots)
+  try {
+    assert.doesNotThrow(() => apply(host.ctx, { lessonsFile: file }), 'a broken store must not break the plugin')
+    const state = host.projectionOf().init()
+    assert.deepEqual(state.lessons, [], 'and the session runs as if there were no lessons')
+    assert.equal(state.lessonsText, '')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+await check('lessons: the record tool refuses a trigger outside the closed set', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'drift-record-'))
+  const file = join(dir, 'lessons.json')
+  const roots = []
+  const host = fakeHost(roots)
+  apply(host.ctx, { lessonsFile: file })
+  const agent = { session: { __state: host.projectionOf().init(), snapshotEvents: () => [] }, id: 'a' }
+  roots.push(agent)
+  const tool = host.registered.toolsByName.get('drift_lesson')
+  try {
+    await assert.rejects(
+      () => tool.execute({ symptom: 's', rule: 'r', trigger: 'whatever-feels-right' }, { agent }),
+      /trigger must be one of/,
+    )
+    const value = await tool.execute({ symptom: 's', rule: 'r', trigger: 'long-turn' }, { agent })
+    assert.equal(value.trigger, 'long-turn')
+    assert.equal(value.stored, 1)
+    assert.match(value.note, /FUTURE sessions, not this one/)
+    const read = await host.registered.toolsByName.get('drift_lessons').execute({}, { agent })
+    assert.equal(read.total, 1)
+    assert.equal(read.active, 1)
+    assert.match(read.triggers, /bulk-replace/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+await check('lessons: a matching call raises the lesson exactly once', async () => {
+  const { host, roots, dir } = mountWithLessons([sampleLesson()])
+  try {
+    const { agent } = lessonSession(host, roots, [turnStart(), human('Fix the parser.'), step()])
+    const listener = host.registered.listeners.get('tools/post-execute')[0]
+    const exec = { agent, name: 'edit', data: { arguments: JSON.stringify({ file_path: '/repo/lessons.spec.mjs' }) } }
+    const first = await listener(exec, undefined, () => ({}))
+    assert.equal(first.additionalContexts?.length, 1, 'a test-file edit matches the trigger')
+    assert.match(first.additionalContexts[0].content[0].text, /L1/)
+    const second = await listener(exec, undefined, () => ({}))
+    assert.equal(second.additionalContexts, undefined, 'and it is not repeated on the next matching call')
+    const other = { agent, name: 'read', data: { arguments: '{}' } }
+    const third = await listener(other, undefined, () => ({}))
+    assert.equal(third.additionalContexts, undefined, 'a call that matches nothing adds nothing')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+await check('lessons: a fired lesson never blocks the call', async () => {
+  const { host, roots, dir } = mountWithLessons([sampleLesson()])
+  try {
+    const { agent } = lessonSession(host, roots, [turnStart(), human('Fix the parser.'), step()])
+    const listener = host.registered.listeners.get('tools/post-execute')[0]
+    const exec = { agent, name: 'edit', data: { arguments: JSON.stringify({ file_path: '/repo/x.spec.mjs' }) } }
+    const result = await listener(exec, undefined, () => ({ kind: 'allow' }))
+    assert.equal(result.kind, 'allow', 'the user chose a reminder, not a gate')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // ==================================================================== report ==
