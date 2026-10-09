@@ -79,32 +79,39 @@
 
 最后一个是关键：**用户批准了新方向，但新契约还没提交**。这个窗口里会话若被打断，绝不能折成 `aligned`——否则是拿**过期契约**当有效。
 
-## 上下文用量（每次请求追加）
+## 上下文用量（按需查询，不注入提示词）
 
-每次请求都会往提示词里追加一行**当前上下文占用**：
+用 **`drift_context_usage`** 工具读取当前上下文占用。**这一行不会被自动注入提示词**，这是刻意的。
 
+```json
+{ "available": true, "usedTokens": 132400, "contextWindow": 1000000,
+  "remainingTokens": 867600, "percent": 13, "projected": true,
+  "summary": "132.4k / 1.00M tokens used (13%)", "note": "..." }
 ```
-Context usage: 132.4k / 1.00M tokens used (13%).
-```
 
-**数字来自 DSH 自己的 token-meter**（`ctx.sessionProjections.stateOf(session, 'contextPressure')`），本插件**不自己估算**。优先用 `projectedTokens`（token-meter 定义的"下一次请求的提示词会花多少"），无采样时回退 `pressureTokens`。理由：第二个用不同口径算出来的估计值会**和你界面上看到的数字对不上**，而一个错的占用率**看起来和一个对的没有区别**——所以宁可复用权威来源。
+### 为什么不做成自动注入
 
-**数据不可用时如实标注，绝不编造**：
+**因为它会破坏 KV 前缀缓存。** 用量数字放在 `systemPrompt.context()` 里就位于**整个请求的最前面**，而前缀缓存从第一个不同的 token 起全部失效——于是每次数字变化都会让缓存的提示词前缀作废，整段前缀要重新处理。
 
-| 情况 | 输出 |
+而这恰好是**最坏的情况**：数字在低占用时基本不动（代价为零），但**越接近满、它变得越频繁**——正好是最不能承受缓存重建的时候。DSH 自己就在追踪这件事（`pressureTokens = inputTokens + cacheReadTokens + cacheWriteTokens`，缓存读写分开计价），所以代价是可见的真实成本。
+
+**信息价值和缓存代价在这里是矛盾的。** 我们选了保缓存：提示词逐字节稳定，需要时问一句就行。
+
+### 数字的来源与诚实边界
+
+取自 **DSH 自己的 token-meter**（`contextPressure`），优先 `projectedTokens`（token-meter 定义的"下一次请求会花多少"），回退 `pressureTokens`。**本插件不自己估算**——第二个口径算出来的数字会和你界面上看到的不一致，而**错的占用率看起来和对的没有区别**。
+
+**没有可信读数时 `available: false` 并给出原因**，绝不给一个看起来像测量值的数字：
+
+| 情况 | `why` |
 |---|---|
-| token-meter 未报告 | 不加这一行（没有测量就没有数字） |
-| 有计数但窗口未知 | `context window not yet reported (…) treat this occupancy as unavailable` |
-| `reportContextUsage: false` | 整行静默 |
+| 未注册 token-meter | `no token-meter projection is registered in this composition` |
+| meter 尚未报告 | `the token meter has not reported a prompt size yet` |
+| 有计数但窗口未知 | `the token meter has counted tokens but the model context window is not known yet` |
 
-**高水位（默认 ≥80%）会升级为告警**，并且不只是报数字——它会明确说清**契约风险**：
+输出是**恒定形状的扁平对象**（registry 要求每个声明的字段都必填），所以 `available: false` 时那些 `0` 是**哨兵值**，由 `available` 消歧——不是声称的测量结果。
 
-> Only 150.0k tokens remain, and this request's contract may still owe ~12 more steps. Once the window is compacted, earlier context - including the original request and this contract - may no longer be retrievable. If the remaining work cannot fit, say so plainly and say what will not fit, **rather than quietly narrowing what you deliver**.
-
-这一段刻意接上相位敏感性那一节：窗口被压缩后**原始请求可能检索不到**，而"悄悄地少做一点"是这种情况下最自然的失败方式。用量行是**提前预警**，不是事后解释。
-
-配置：`reportContextUsage`（默认 `true`）、`contextPressureWarnAt`（默认 `80`）。
-
+`note` 字段携带契约风险提示：窗口被压缩后**原始请求可能检索不到**，如果剩余工作放不下应当**明说放不下什么**，而不是悄悄少做。
 ## 全自动模式与三道机械闸门
 
 用户可以选择**不被偏移决策打断**。这条路解决了"每次都来问我"的烦扰，但代价必须写清：

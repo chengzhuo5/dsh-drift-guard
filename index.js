@@ -52,6 +52,40 @@ const ANCHOR_TOOL = 'drift_anchor'
 /** Model-facing direction-change tool. */
 const DRIFT_TOOL = 'drift_report'
 
+/**
+ * Model-facing read-only occupancy tool.
+ *
+ * Occupancy is exposed as a tool rather than injected as prompt text so the
+ * prompt stays byte-stable: anything that changes inside the system prompt sits
+ * at the front of the request and invalidates the provider's cached prefix.
+ */
+const USAGE_TOOL = 'drift_context_usage'
+
+/** No parameters: reading occupancy has nothing to configure. */
+const USAGE_PARAMETERS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {},
+}
+
+/** Occupancy reading. `available: false` carries the reason instead of a guess. */
+const USAGE_VALUE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['available', 'why', 'usedTokens', 'contextWindow', 'remainingTokens', 'percent', 'projected', 'summary', 'note'],
+  properties: {
+    available: { type: 'boolean', description: 'False when no trustworthy reading exists.' },
+    why: { type: 'string', description: 'Why no reading exists. Empty when a reading is available: keep it out of the output in that case, which the declared optional wrapper allows.' },
+    usedTokens: { type: 'number', description: 'Prompt-side tokens the next request would cost.' },
+    contextWindow: { type: 'number' },
+    remainingTokens: { type: 'number' },
+    percent: { type: 'number' },
+    projected: { type: 'boolean', description: 'True when this is the projected (not sampled) figure.' },
+    summary: { type: 'string' },
+    note: { type: 'string' },
+  },
+}
+
 /** Closed-step mark at which an agent that never committed a contract is asked once. */
 const DEFAULT_ASK_ANCHOR_AT = 2
 
@@ -249,8 +283,6 @@ export function resolveConfig(config) {
     reportDeferrals: raw.reportDeferrals ?? false,
     autoDrift: raw.autoDrift ?? true,
     mutationBudget: raw.mutationBudget ?? DEFAULT_MUTATION_BUDGET,
-    reportContextUsage: raw.reportContextUsage ?? true,
-    contextPressureWarnAt: raw.contextPressureWarnAt ?? 80,
   }
   for (const key of ['stepBudget', 'askAnchorAt']) {
     const value = resolved[key]
@@ -264,7 +296,7 @@ export function resolveConfig(config) {
       throw new Error(`drift-guard: ${key} must be a non-negative safe integer, got ${String(value)}`)
     }
   }
-  for (const key of ['requireCoverage', 'blockUnfinished', 'reportDeferrals', 'autoDrift', 'reportContextUsage']) {
+  for (const key of ['requireCoverage', 'blockUnfinished', 'reportDeferrals', 'autoDrift']) {
     if (typeof resolved[key] !== 'boolean') {
       throw new Error(`drift-guard: ${key} must be a boolean, got ${typeof resolved[key]}`)
     }
@@ -797,37 +829,70 @@ function projectionDefinition(options = {}) {
  * "what the NEXT request's prompt would cost"; `pressureTokens` is the fallback
  * when no surface movement has been sampled since the last reading.
  *
- * @returns the usage line, or undefined when the meter has not reported yet.
- * Nothing is invented in that case - a fabricated number would be worse than no
- * number, because a wrong occupancy reading cannot be told apart from a right one.
+ * This is exposed ONLY through a read-only tool, never injected into the prompt.
+ * A usage line inside the system prompt sits at the very front of the request,
+ * so every time the number changed it would invalidate the provider's cached
+ * prompt prefix and force the whole prefix to be re-processed; a figure that
+ * changes as the window fills is exactly the case that invalidates it most
+ * often. Keeping the prompt byte-stable is worth more than the unsolicited
+ * reminder, so the agent asks when it wants to know.
+ *
+ * @returns structured occupancy, or a reason it is unavailable. Nothing is
+ * invented: a fabricated number cannot be told apart from a measured one.
  */
-function renderContextUsage(ctx, agent, state, resolved) {
-  if (!resolved.reportContextUsage) return undefined
+function readContextUsage(ctx, agent) {
   const pressure = ctx.sessionProjections?.stateOf?.(agent.session, 'contextPressure')
-  if (pressure === null || typeof pressure !== 'object') return undefined
-  const used = pressure.projectedTokens ?? pressure.pressureTokens
-  const window = pressure.contextWindow
-  if (typeof used !== 'number' || !Number.isFinite(used)) return undefined
-  if (typeof window !== 'number' || !Number.isFinite(window) || window <= 0) {
-    // The meter has started reporting but the window is not known yet. Say the
-    // reading is degraded instead of printing a bare count that would read like a
-    // validated occupancy figure.
-    return `Context usage: ${formatTokens(used)} tokens used, context window not yet reported `
-      + '(token meter has not settled; treat this occupancy as unavailable).'
+  if (pressure === null || typeof pressure !== 'object') {
+    return unavailable('no token-meter projection is registered in this composition')
   }
-  const percent = Math.min(100, Math.round(used / window * 100))
-  const row = `${formatTokens(used)} / ${formatTokens(window)} tokens used (${percent}%)`
-  if (percent < resolved.contextPressureWarnAt) return `Context usage: ${row}.`
+  const used = pressure.projectedTokens ?? pressure.pressureTokens
+  if (typeof used !== 'number' || !Number.isFinite(used)) {
+    return unavailable('the token meter has not reported a prompt size yet')
+  }
+  const window = pressure.contextWindow
+  if (typeof window !== 'number' || !Number.isFinite(window) || window <= 0) {
+    return {
+      ...unavailable('the token meter has counted tokens but the model context window is not known yet'),
+      usedTokens: used,
+    }
+  }
   const left = Math.max(0, window - used)
-  const steps = state?.contract?.budget ?? resolved.stepBudget
-  return `Context usage: ${row} - WARNING. Only ${formatTokens(left)} tokens remain, and `
-    + `this request's contract may still owe ~${steps} more steps. Once the window is compacted, `
-    + 'earlier context - including the original request and this contract - may no longer be '
-    + 'retrievable. If the remaining work cannot fit, say so plainly and say what will not fit, '
-    + 'rather than quietly narrowing what you deliver.'
+  return {
+    available: true,
+    usedTokens: used,
+    contextWindow: window,
+    remainingTokens: left,
+    percent: Math.min(100, Math.round(used / window * 100)),
+    why: '',
+    projected: pressure.projectedTokens !== undefined,
+    summary: `${formatTokens(used)} / ${formatTokens(window)} tokens used (${Math.min(100, Math.round(used / window * 100))}%)`,
+    note: 'Once the window is compacted, earlier context - including the original request and this '
+      + 'contract - may no longer be retrievable. If the remaining work cannot fit, say so plainly '
+      + 'and say what will not fit, rather than quietly narrowing what you deliver.',
+  }
 }
 
-/** Compact token counts so the line stays short in a prompt. */
+/**
+ * The unavailable shape. Every declared field is present so the output schema
+ * stays a single flat object with nothing optional - a reading is either
+ * trustworthy (`available: true`) or it is not, and the zeros below are a
+ * sentinel that `available` disambiguates, never a claimed measurement.
+ */
+function unavailable(why) {
+  return {
+    available: false,
+    why,
+    usedTokens: 0,
+    contextWindow: 0,
+    remainingTokens: 0,
+    percent: 0,
+    projected: false,
+    summary: '',
+    note: '',
+  }
+}
+
+/** Compact token counts. */
 function formatTokens(value) {
   if (value < 1000) return String(value)
   if (value < 1_000_000) return `${(value / 1000).toFixed(1)}k`
@@ -1285,7 +1350,6 @@ const DRIFT_VALUE_SCHEMA = {
 }
 
 // ---------------------------------------------------------- arg validation --
-
 /**
  * Structural validation, because these tools are registered without
  * `defineTool`. The declared schema constrains the happy path; this guarantees
@@ -1492,17 +1556,12 @@ export function apply(ctx, config) {
       const agent = assemble?.scope
       if (agent?.session === undefined) return ''
       const state = stateOf(ctx, agent)
+      // Nothing occupancy-related is injected here, on purpose: a value that
+      // changes would sit at the front of the request and invalidate the
+      // provider's cached prompt prefix. Read it with USAGE_TOOL instead.
+      if (state === undefined) return ''
+      if (state.baseline === null && state.contract === null) return ''
       const parts = []
-      // Context occupancy is appended on EVERY request, including ones that carry
-      // no contract yet: it is exactly when the window is filling that the agent
-      // most needs to know, and the guard restates the request every turn anyway.
-      if (state !== undefined) {
-        const usage = renderContextUsage(ctx, agent, state, resolved)
-        if (usage !== undefined) parts.push(usage)
-      }
-      if (state === undefined || (state.baseline === null && state.contract === null)) {
-        return parts.join('\n\n')
-      }
       if (state.baseline !== null) parts.push(renderBaseline(state.baseline))
       parts.push(renderContract(state, resolved.stepBudget))
       return parts.join('\n\n')
@@ -1608,8 +1667,7 @@ export function apply(ctx, config) {
       card: 'generic',
       title: `Report direction change: ${String(args?.reason ?? '')}`,
       kind: 'other',
-    }),
-    async execute(args, exec) {
+    }),    async execute(args, exec) {
       const agent = exec.agent
       if (agent === undefined) throw new Error(`${DRIFT_TOOL} requires a calling agent`)
       const requested = validateDriftArgs(args)
@@ -1724,7 +1782,22 @@ export function apply(ctx, config) {
       }
     },
   })
-
+  ctx.tools.register({
+    name: USAGE_TOOL,
+    description: 'Read the CURRENT context occupancy: how much of the model context window the next request would use, and how much is left. Read-only, no arguments. Occupancy is deliberately NOT injected into your prompt, because a value that changes inside the system prompt sits at the front of the request and invalidates the provider\'s cached prompt prefix. Call this when you want to know how much room remains before compaction, especially if the contract still owes substantial work. It reports available:false with a reason rather than inventing a number when DSH\'s token meter has not measured the prompt yet.',
+    parameters: USAGE_PARAMETERS,
+    output: {
+      schema: USAGE_VALUE_SCHEMA,
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    presentCall: () => ({ card: 'generic', title: 'Read context occupancy', kind: 'read' }),
+    isReadOnly: () => true,
+    async execute(_args, exec) {
+      const agent = exec.agent
+      if (agent === undefined) throw new Error(`${USAGE_TOOL} requires a calling agent`)
+      return readContextUsage(ctx, agent)
+    },
+  })
   /**
    * Per-agent guard memory: checkpoint dedupe within a turn, the forced-steer
    * count, and the lifetime message ceiling. Plugin memory is a derived cache —

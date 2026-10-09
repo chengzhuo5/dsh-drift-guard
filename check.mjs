@@ -587,15 +587,15 @@ await check('answer mapping: an unknown label throws instead of recording a reje
 
 // ================================================================== the tools ==
 
-await check('the plugin registers two tools, one section, one context, two listeners', () => {
+await check('the plugin registers three tools, one section, one context, two listeners', () => {
   const { host } = mount()
-  assert.deepEqual(host.registered.tools.map(t => t.name).sort(), ['drift_anchor', 'drift_report'])
+  assert.deepEqual(host.registered.tools.map(t => t.name).sort(), ['drift_anchor', 'drift_context_usage', 'drift_report'])
   assert.equal(host.registered.sections.length, 1)
   assert.equal(host.registered.contexts.length, 1)
   assert.equal(host.registered.listeners.get('tools/post-execute').length, 1)
   assert.equal(host.registered.listeners.get('agent/turn-stopping').length, 1)
 })
-await check('both tool schemas are inside the enforced JSON Schema subset', () => {
+await check('every tool schema is inside the enforced JSON Schema subset', () => {
   const { host } = mount()
   for (const definition of host.registered.tools) {
     assertSchema(definition.parameters, `${definition.name}.parameters`)
@@ -1249,49 +1249,74 @@ await check('auto: off means every report asks the user', async () => {
 })
 
 // ======================================================= context occupancy ==
+// Occupancy is a TOOL, never injected prompt text. A changing value inside the
+// system prompt would sit at the front of the request and invalidate the
+// provider's cached prompt prefix, so the prompt must stay byte-stable and the
+// agent asks when it wants to know.
 
-/** Render the prompt-context provider with one pressure reading installed. */
-function usageLine(pressure, config = {}) {
+/** Run the occupancy tool with one pressure reading installed. */
+function usageRead(pressure) {
   const roots = []
   const host = fakeHost(roots)
-  apply(host.ctx, config)
+  apply(host.ctx, {})
   const projection = host.projectionOf()
   let state = projection.init()
   for (const event of [turnStart(), human('Fix the login bug.'), step()]) state = projection.apply(state, event)
   const session = { __state: state, __pressure: pressure, snapshotEvents: () => [] }
   const agent = { session, id: 'a' }
   roots.push(agent)
-  const provider = host.registered.contexts.find(entry => entry.name === 'drift-guard')
-  return provider.text({ scope: agent })
+  return host.registered.toolsByName.get('drift_context_usage')
+    .execute({}, { agent, name: 'drift_context_usage' })
 }
-
-await check('usage: the current occupancy is appended on every request', async () => {
-  const text = usageLine({ contextWindow: 100_000, pressureTokens: 25_000 })
-  assert.match(text, /Context usage: 25\.0k \/ 100\.0k tokens used \(25%\)/)
+await check('usage: the tool reports occupancy when the meter has a reading', async () => {
+  const value = await usageRead({ contextWindow: 100_000, pressureTokens: 25_000 })
+  assert.equal(value.available, true)
+  assert.equal(value.usedTokens, 25_000)
+  assert.equal(value.remainingTokens, 75_000)
+  assert.equal(value.percent, 25)
+  assert.match(value.summary, /25\.0k \/ 100\.0k tokens used \(25%\)/)
 })
 await check('usage: projected tokens win over the last sample', async () => {
-  const text = usageLine({ contextWindow: 100_000, pressureTokens: 10_000, projectedTokens: 30_000 })
-  assert.match(text, /30\.0k \/ 100\.0k tokens used \(30%\)/)
+  const value = await usageRead({ contextWindow: 100_000, pressureTokens: 10_000, projectedTokens: 30_000 })
+  assert.equal(value.usedTokens, 30_000, 'the projected figure is the next request cost')
+  assert.equal(value.projected, true)
 })
-await check('usage: a high-water mark warns instead of stating a bare number', async () => {
-  const text = usageLine({ contextWindow: 100_000, projectedTokens: 85_000 })
-  assert.match(text, /WARNING/)
-  assert.match(text, /15\.0k tokens remain/)
-  assert.match(text, /rather than quietly narrowing what you deliver/)
+await check('usage: no meter means available:false with a reason, never a guess', async () => {
+  const value = await usageRead(undefined)
+  assert.equal(value.available, false)
+  assert.match(value.why, /no token-meter projection/)
+  assert.equal(value.usedTokens, 0, 'the zeros are a sentinel, not a measurement')
+  assert.equal(value.percent, 0)
 })
-await check('usage: no meter at all adds nothing and invents nothing', async () => {
-  const text = usageLine(undefined)
-  assert.equal(text.includes('Context usage'), false, 'nothing is reported when nothing is measured')
+await check('usage: a count without a window is unavailable, not a bare number', async () => {
+  const value = await usageRead({ pressureTokens: 4_000 })
+  assert.equal(value.available, false)
+  assert.match(value.why, /context window is not known/)
+  assert.equal(value.percent, 0)
 })
-await check('usage: a count without a window is marked unavailable', async () => {
-  const text = usageLine({ pressureTokens: 4_000 })
-  assert.match(text, /context window not yet reported/)
-  assert.match(text, /unavailable/)
-  assert.equal(/\(\d+%\)/.test(text), false, 'no percentage is invented')
+await check('usage: the meter not having reported yet is unavailable', async () => {
+  const value = await usageRead({ contextWindow: 100_000 })
+  assert.equal(value.available, false)
+  assert.match(value.why, /has not reported a prompt size/)
 })
-await check('usage: reportContextUsage false silences the line', async () => {
-  const text = usageLine({ contextWindow: 100_000, projectedTokens: 50_000 }, { reportContextUsage: false })
+await check('usage: the prompt carries NO occupancy text, so the prefix stays stable', async () => {
+  // The whole point of moving this to a tool: nothing occupancy-related may
+  // appear in the injected prompt, because it would invalidate the cached
+  // prefix every time the number moved.
+  const roots = []
+  const host = fakeHost(roots)
+  apply(host.ctx, {})
+  const projection = host.projectionOf()
+  let state = projection.init()
+  for (const event of [turnStart(), human('Fix the login bug.'), step()]) state = projection.apply(state, event)
+  const session = { __state: state, __pressure: { contextWindow: 100_000, projectedTokens: 85_000 }, snapshotEvents: () => [] }
+  const agent = { session, id: 'a' }
+  roots.push(agent)
+  const provider = host.registered.contexts.find(entry => entry.name === 'drift-guard')
+  const text = provider.text({ scope: agent })
   assert.equal(text.includes('Context usage'), false)
+  assert.equal(text.includes('85.0k'), false)
+  assert.equal(text.includes('WARNING'), false)
 })
 
 // ==================================================================== report ==
