@@ -30,6 +30,9 @@ import {
   outstandingPlan,
   BUDGET_STEPS_PER_ITEM,
   COMMIT_RESERVE_STEPS,
+  decorationDensity,
+  DECORATION_P90,
+  DECORATION_NORMAL,
 } from './index.js'
 
 const failures = []
@@ -1913,6 +1916,62 @@ await check('budget: the plan derives the step budget and keeps a commit reserve
   assert.equal(deriveBudget(null), undefined, 'no plan, no derived budget')
 })
 
+
+// ================================================ decoration is not content ==
+// The user showed a screenshot and said "very verbose". Length was FLAT across
+// months - the growth was entirely in decoration. Measured over 3562 messages of
+// 200+ chars, decoration per 1000 chars is:
+//   p50 14.4 | p75 24.6 | p90 39.6 | p99 79.7
+// and the specific message complained about scored 30.9.
+//
+// So "verbose" here means "wearing more costume per sentence", and that IS
+// countable. What is NOT countable - stale wording, unnatural tone - is left
+// alone, because this project measured that class of judgement at 6.2%.
+
+const plain = 'The parser reads the file and returns the rows it found. It stops at the first blank line.'
+const dressed = [
+  '## ✅ 结论',
+  '',
+  '| 项 | 值 |',
+  '|---|---|',
+  '| A | 1 |',
+  '',
+  '★ **重点**：⚠️ 这不是（注：真的不是）⇒ 而是 ✅ **那个**（备注）',
+].join('\n')
+
+await check('decoration: plain prose scores near zero', () => {
+  const d = decorationDensity(plain)
+  assert.ok(d.per1000 < 5, `plain text carries almost no decoration (got ${d.per1000})`)
+})
+await check('decoration: the dressed example scores far above the floor', () => {
+  const d = decorationDensity(dressed)
+  assert.ok(d.per1000 > DECORATION_P90, `dressed text must trip the threshold (got ${d.per1000})`)
+})
+await check('decoration: each marker family is counted separately', () => {
+  const d = decorationDensity(dressed)
+  assert.ok(d.counts.emoji >= 2, 'emoji counted')
+  assert.ok(d.counts.bold >= 2, 'bold runs counted')
+  assert.ok(d.counts.arrow >= 1, 'arrows counted')
+  assert.ok(d.counts.tag >= 2, 'parenthesised tags counted')
+  assert.ok(d.counts.table >= 3, 'table rows counted')
+})
+await check('decoration: the threshold comes from measurement, not taste', () => {
+  // p90 of real traffic. Anything inside normal traffic must not be flagged.
+  assert.equal(DECORATION_P90, 40)
+  assert.ok(DECORATION_NORMAL < DECORATION_P90, 'normal sits below the trigger')
+})
+await check('decoration: fenced code is excluded from the denominator', () => {
+  // A long code block would otherwise dilute density and hide the costume.
+  const withCode = dressed + '\n\n```js\n' + 'const x = 1\n'.repeat(60) + '```'
+  const bare = decorationDensity(dressed)
+  const fenced = decorationDensity(withCode)
+  assert.deepEqual(fenced.counts, bare.counts, 'code contributes no decoration')
+  assert.ok(fenced.per1000 >= bare.per1000, 'and does not dilute the measurement either')
+})
+await check('decoration: an empty message is not a division by zero', () => {
+  assert.equal(decorationDensity('').per1000, 0)
+  assert.equal(decorationDensity(undefined).per1000, 0)
+})
 
 // ==================================================================== report ==
 

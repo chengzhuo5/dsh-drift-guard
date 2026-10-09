@@ -512,6 +512,8 @@ function initialState() {
   toolsThisTurn: 0,
   /** Consecutive turn endings that used no tool at all. Cleared by any tool call. */
   stalledTurns: 0,
+  /** Summed decoration density across this request's assistant messages. */
+  decorationUnits: 0,
     /**
      * The turn key the guard itself asked for a contract in. `null` means it
      * has not asked yet; recording the key keeps the ask one-shot WITHOUT
@@ -618,6 +620,7 @@ function parseState(value) {
     stepsThisTurn: count(raw.stepsThisTurn, 0),
     toolsThisTurn: count(raw.toolsThisTurn, 0),
     stalledTurns: count(raw.stalledTurns, 0),
+    decorationUnits: count(raw.decorationUnits, 0),
     askedAnchorAtTurn: Number.isFinite(raw.askedAnchorAtTurn) ? raw.askedAnchorAtTurn : null,
   }
 }
@@ -826,6 +829,15 @@ function projectionDefinition(options = {}) {
           // guard came to flag its own explanation.
           const origin = event.data?.message?.source?.kind
           if (origin !== undefined && origin !== 'model') return state
+          // Decoration density is accumulated from the model's own words, before the
+          // deferral check returns early - the costume is worth counting whether or
+          // not deferral detection is switched on.
+          {
+            const density = decorationDensity(textOfMessage(event.data?.message))
+            if (density.chars >= 200) {
+              state = { ...state, decorationUnits: (state.decorationUnits ?? 0) + density.per1000 }
+            }
+          }
           // Deferral-phrase detection is off by default (see DEFERRAL_MARKERS):
           // three live runs produced three false positives, because real text is
           // full of prose *discussing* shortfalls. The fold stays inert unless a
@@ -1676,6 +1688,9 @@ export {
   outstandingPlan,
   BUDGET_STEPS_PER_ITEM,
   COMMIT_RESERVE_STEPS,
+  decorationDensity,
+  DECORATION_P90,
+  DECORATION_NORMAL,
   anchorValue,
   POLICY,
   FROZEN_CORE_NAMES,
@@ -1746,8 +1761,7 @@ function resultText(result) {
 }
 
 /** Steps granted per plan item, mirroring POLICY.budgetStepsPerItem. */
-const BUDGET_STEPS_PER_ITEM = 4
-/** Steps withheld so the commit is not the thing that gets cut, mirroring POLICY. */
+const BUDGET_STEPS_PER_ITEM = 4/** Steps withheld so the commit is not the thing that gets cut, mirroring POLICY. */
 const COMMIT_RESERVE_STEPS = 3
 /** A plan item marked like this is an answer, not a silent drop. */
 const WAIVED_MARK = /\[waived\b/i
@@ -1833,6 +1847,96 @@ function renderPlanFirst(steps) {
     'On a turn this long, a list is what keeps the original request in view - and it is also',
     'the only thing that lets this guard hold you to a plan. Write one with todo_write, then',
     'carry on. This is asked once.',
+  ].join('\n')
+}
+
+/**
+ * Decoration density: how much costume a message wears per character of content.
+ *
+ * The user showed a screenshot and said "very verbose". Length was FLAT across
+ * months - median 81 -> 88 -> 77 chars. The growth was entirely in decoration:
+ * table rows +268%, em dashes +243%, bold headings +187%, and prose bullets halved.
+ * So "verbose" here means "more costume per sentence", and THAT is countable.
+ *
+ * Measured over 3562 assistant messages of 200+ chars, decoration units per 1000
+ * chars: p50 14.4 | p75 24.6 | p90 39.6 | p99 79.7. The message complained about
+ * scored 30.9. The threshold is the p90 of real traffic - it is measured, not
+ * taste, and anything inside normal traffic stays silent.
+ *
+ * What this deliberately does NOT do: judge wording. Stale phrasing and unnatural
+ * tone are semantic, and this project measured that class of judgement at 6.2%.
+ */
+const DECORATION_P90 = 40
+/** The median of real traffic, quoted in the reminder so the number has context. */
+const DECORATION_NORMAL = 14
+
+const FENCED_CODE = /^[ \t]*```[\s\S]*?^[ \t]*```[ \t]*$/gm
+const INLINE_CODE = /`[^`\n]*`/g
+const EMOJI_CHAR = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{2705}\u{274C}\u{2B50}\u{26A0}]/gu
+const BOLD_RUN = /\*\*[^*\n]+\*\*/g
+const ARROW_CHAR = /[⇒→←⇐⇔]|=>/g
+
+/**
+ * Count the four families of decoration and normalise by prose length.
+ *
+ * Fenced code is excluded from both the count and the denominator: a long code
+ * block would otherwise dilute the density and hide the costume, which is the
+ * failure mode a naive length check has.
+ *
+ * @returns {{counts: object, chars: number, per1000: number}}
+ */
+function decorationDensity(text) {
+  const raw = typeof text === 'string' ? text : ''
+  const prose = raw.replace(FENCED_CODE, '')
+  const chars = prose.trim().length
+  const counts = {
+    emoji: (prose.match(EMOJI_CHAR) ?? []).length,
+    bold: (prose.replace(INLINE_CODE, '').match(BOLD_RUN) ?? []).length,
+    arrow: (prose.replace(INLINE_CODE, '').match(ARROW_CHAR) ?? []).length,
+    tag: (prose.match(/[（(【\[][^）)】\]\n]{0,24}[）)】\]]/g) ?? []).length,
+    table: (prose.match(/^\s*\|.*\|\s*$/gm) ?? []).length,
+  }
+  if (chars === 0) return { counts, chars: 0, per1000: 0 }
+  // Each family is weighted so that one wrapper costs roughly as much as one
+  // character of prose: a decorated line therefore has to earn its decoration.
+  const units =
+    counts.bold * 2 +
+    counts.emoji * 1.5 +
+    counts.tag * 1.5 +
+    counts.table * 1.5 +
+    counts.arrow * 1
+  return { counts, chars, per1000: (units / chars) * 1000 }
+}
+
+/** Read a plain string out of an assistant message body, for density purposes. */
+function textOfMessage(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter(part => part?.type === 'text')
+    .map(part => String(part.text ?? ''))
+    .join('\n')
+}
+
+/**
+ * Name the costume instead of judging the prose.
+ *
+ * The reminder reports what it counted and what normal looks like, and says
+ * outright that it is not judging the words - because it cannot. The fix for
+ * stale wording lives in decoding or training, which no plugin can reach.
+ */
+function renderDecorationNotice(per1000) {
+  return [
+    `drift-guard: this reply is wearing ${Math.round(per1000)} units of decoration per 1000 characters.`,
+    '',
+    `Normal traffic in the logs sits around ${DECORATION_NORMAL}, and ${DECORATION_P90} is the top tenth.`,
+    'Counted: emoji, bold runs, parenthesised tags, table rows, arrows.',
+    '',
+    'This is not a judgement of your words - the guard has no way to judge wording, and',
+    'says so rather than pretending. It is a count of costume per sentence. When this',
+    'number climbs, the reader spends attention on formatting instead of on the answer.',
+    '',
+    'Consider prose for the next reply. This is asked once and blocks nothing.',
   ].join('\n')
 }
 
@@ -2372,6 +2476,7 @@ export function apply(ctx, config) {
       searchReminded: false,
       planReminded: false,
       planFirstAsked: false,
+      decorationReminded: false,
     }
   }
 
@@ -2513,6 +2618,16 @@ export function apply(ctx, config) {
     if (todos === undefined && planSteps >= resolved.planBySteps && entry.planFirstAsked !== true) {
       memory.set(agent, { ...spend, steers: steers + 1, planFirstAsked: true })
       steer(agent, renderPlanFirst(planSteps))
+      return
+    }
+
+    // Decoration: costumes per character, not words. Length was flat while table
+    // rows and bold headings climbed, so "verbose" here means "wearing more
+    // costume per sentence" - which is countable. Wording is not, and is not judged.
+    const decorated = Number.isFinite(state.decorationUnits) ? state.decorationUnits : 0
+    if (decorated >= DECORATION_P90 && entry.decorationReminded !== true) {
+      memory.set(agent, { ...spend, steers: steers + 1, decorationReminded: true })
+      steer(agent, renderDecorationNotice(decorated))
       return
     }
 
