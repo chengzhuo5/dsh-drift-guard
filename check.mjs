@@ -2167,6 +2167,51 @@ await check('detail: the question template is Chinese and bounded', () => {
   assert.ok(String(question.text).length <= 400, 'the question is capped in length')
 })
 
+// ==== the plan check must not depend on one projection key ==================
+// The user reported this twice: "sessions still end with tasks unfinished". Measured
+// from the real logs, todo_write is genuinely in use (545 calls, payload
+// {content, status}), and the projection service hands EVERY committed event to
+// every registered unit - so a todo/write event is delivered to the guard whether or
+// not any 'todos' projection key exists.
+//
+// The check nevertheless did nothing, because planOf read stateOf(session, 'todos')
+// and nothing else: an absent or differently-named key returned undefined, which is
+// indistinguishable from "the agent never planned". That single point of failure is
+// what these tests pin down.
+
+const TODO_WRITE = (todos) => ({ type: 'todo/write', seq: 9, time: 9, data: { todos } })
+
+await check('plan: a todo/write event is recorded by the guard itself', () => {
+  const { fold, projection } = mount()
+  const withList = fold([TODO_WRITE([ITEM('a', 'pending'), ITEM('b', 'completed')])])
+  assert.ok(Array.isArray(withList.ownPlan), 'the guard keeps its own copy')
+  assert.equal(withList.ownPlan.length, 2)
+  assert.deepEqual(outstandingPlan(withList.ownPlan).map(i => i.content), ['a'])
+})
+
+await check('plan: ownPlan survives the persisted-state round trip', () => {
+  const { fold } = mount()
+  const withList = fold([TODO_WRITE([ITEM('a', 'pending')])])
+  const parsed = parseState(JSON.parse(JSON.stringify(withList)))
+  assert.deepEqual(parsed.ownPlan, withList.ownPlan)
+})
+
+await check('plan: a malformed todo/write payload changes nothing', () => {
+  const { fold } = mount()
+  const state = fold([
+    TODO_WRITE([ITEM('a', 'pending')]),
+    { type: 'todo/write', seq: 10, time: 10, data: { todos: 'not a list' } },
+  ])
+  assert.deepEqual(state.ownPlan.map(i => i.content), ['a'], 'the last good list stands')
+})
+
+await check('plan: the reason todo/write is needed at all', () => {
+  // Documents the failure mode: with no 'todos' key, the projection path is useless,
+  // and this is why relying on it alone meant the check silently never fired.
+  const double = { sessionProjections: { stateOf: () => undefined } }
+  assert.equal(double.sessionProjections.stateOf({}, 'todos'), undefined)
+})
+
 // ==================================================================== report ==
 
 if (failures.length > 0) {

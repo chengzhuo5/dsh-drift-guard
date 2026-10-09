@@ -516,6 +516,8 @@ function initialState() {
   decorationUnits: 0,
   /** Raw prose characters summed alongside the units, so the ratio divides once. */
   decorationChars: 0,
+  /** The agent's own todo list, folded from todo/write by the guard itself. */
+  ownPlan: null,
   /** True while every message this turn only asked, and none delivered. */
   questionsOnly: true,
   /** Whether the question tool ran this turn. Using it IS the correct form. */
@@ -634,6 +636,7 @@ function parseState(value) {
     // and both turn/start and any substantive message reset it. Persisting it would
     // make a stale false outlive its turn, so it is dropped here and re-derived.
     questionsOnly: true,
+    ownPlan: Array.isArray(raw.ownPlan) ? raw.ownPlan : null,
     // Also transient, also re-derived: both turn/start and the tool-call fold set
     // these, so a persisted copy would outlive the turn it describes.
     usedQuestionTool: false,
@@ -893,6 +896,18 @@ function projectionDefinition(options = {}) {
           for (const marker of found) if (!merged.includes(marker)) merged.push(marker)
           if (merged.length === state.deferrals.length) return state
           return { ...state, deferrals: merged, deferralSeq: event.seq }
+        }
+        case 'todo/write': {
+          // The eager drive hands every committed event to every registered unit, so
+          // the guard sees the agent's own list regardless of who owns the 'todos'
+          // projection key. Recording it HERE removes the single point of failure:
+          // the plan check used to depend entirely on stateOf(session, 'todos'),
+          // which returns undefined when that key is absent or named differently -
+          // and then the check silently did nothing, which is exactly the failure
+          // the user kept seeing.
+          const list = event.data?.todos
+          if (!Array.isArray(list)) return state
+          return { ...state, ownPlan: list }
         }
         case 'tool/call': {
           // Counted before any filtering: what matters is that a tool ran, not
@@ -1862,6 +1877,19 @@ function outstandingPlan(todos) {
 
 /** Read the agent's plan, or undefined when this composition has no todo unit. */
 function planOf(ctx, agent) {
+  // The guard's OWN record first. It is folded from the todo/write events the eager
+  // drive delivers to every registered unit, so it does not depend on the 'todos'
+  // projection key existing or being spelled that way. Relying on that key alone was
+  // a silent single point of failure: stateOf returns undefined when the key is
+  // absent, planOf returned undefined, and the plan check then did nothing at all -
+  // which is precisely the "session ended with items undone" the user kept seeing.
+  let own = null
+  try {
+    own = stateOf(ctx, agent)?.ownPlan ?? null
+  } catch {
+    own = null
+  }
+  if (Array.isArray(own)) return own
   try {
     const todos = ctx.sessionProjections?.stateOf?.(agent?.session, 'todos')
     return Array.isArray(todos) ? todos : undefined
