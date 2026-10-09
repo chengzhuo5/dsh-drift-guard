@@ -1665,9 +1665,96 @@ export {
   mapDriftAnswer,
   deferralMarkers,
   parseState,
+  searchOutcome,
   anchorValue,
   POLICY,
   FROZEN_CORE_NAMES,
+}
+
+/** Tools whose whole purpose is to settle a fact the model does not already hold. */
+const SEARCH_TOOL = /^(web_search|web_fetch|fetch|mcp__[a-z0-9_]*__(web_)?(search|fetch))$/i
+
+/**
+ * Classify one search tool's result: did the lookup actually happen?
+ *
+ * This is the only unambiguous signal in this whole area. "Which claim needs an
+ * external source" is a semantic question - measured in this project at 6.2%
+ * precision, below chance - so the guard does NOT ask it. "The lookup failed" is a
+ * fact, and the evidence that it matters is measured: of the 15 sessions in the
+ * real logs that searched at all, 10 had a search fail, and the reply often simply
+ * carried on.
+ *
+ * The status line is what web_fetch writes, verified against real logs:
+ *   `Fetched <url> (HTTP 404)\n\nExternal web content follows. ...`
+ * That framing sentence appears in EVERY fetch result - success or failure - so it
+ * is emphatically not an error word. Only the leading status counts, which is why
+ * the test insists a bare "404" further down the page is not a failure.
+ *
+ * @returns {{status: 'ok'|'failed'|'irrelevant'}}
+ */
+function searchOutcome(toolName, text) {
+  const tool = String(toolName ?? '')
+  if (!SEARCH_TOOL.test(tool)) return { status: 'irrelevant' }
+  const body = typeof text === 'string' ? text : ''
+  // Nothing came back at all. An empty answer is not an answer.
+  if (body.trim().length === 0) return { status: 'failed', reason: 'empty result' }
+  const fetched = /^\s*Fetched\s+\S+\s+\(HTTP (\d{3})\)/i.exec(body)
+  if (fetched !== null) {
+    const code = Number(fetched[1])
+    if (code >= 400) return { status: 'failed', reason: `HTTP ${code}` }
+    return { status: 'ok' }
+  }
+  if (/(^|\n)\s*(Error|Fetch failed|search failed)\b/i.test(body)) {
+    return { status: 'failed', reason: 'error reported' }
+  }
+  if (/\bETIMEDOUT|ECONNREFUSED|ENOTFOUND|ECONNRESET|socket hang up|timed out\b/i.test(body)) {
+    return { status: 'failed', reason: 'network error' }
+  }
+  return { status: 'ok' }
+}
+
+/**
+ * Pull the text out of one post-execute result without assuming its exact shape.
+ *
+ * The precise `ToolExecutionResult` field layout was not verified here, and getting
+ * it wrong would fail silently - a lesson already paid for twice in this project.
+ * So every plausible carrier is tried, and the first non-empty string wins.
+ */
+function resultText(result) {
+  if (typeof result === 'string') return result
+  if (result === undefined || result === null) return ''
+  for (const candidate of [result.text, result.value, result.message, result.error, result.reason]) {
+    if (typeof candidate === 'string' && candidate.length > 0) return candidate
+  }
+  const content = result.content ?? result.message?.content
+  if (Array.isArray(content)) {
+    return content
+      .map(part => (typeof part === 'string' ? part : typeof part?.text === 'string' ? part.text : ''))
+      .join('')
+  }
+  return ''
+}
+
+/**
+ * Refuse to let a failed lookup pass as a settled fact.
+ *
+ * The guard does not judge which claims need a source - that is the semantic
+ * question this project measured at 6.2% precision. It only reports what it saw:
+ * the lookup came back with an error, and nothing has come back since. Both exits
+ * are real answers; a silent third one is not.
+ */
+function renderSearchUnverified(reason) {
+  return [
+    `drift-guard: the last lookup failed (${reason}) and nothing has settled it since.`,
+    '',
+    'You may still be right - this is not a claim that the answer is wrong. It is a',
+    'claim that it is UNVERIFIED, and the difference matters when the answer is about',
+    'a version, an API, a flag or someone else\'s behaviour.',
+    '',
+    'Do one of these before closing:',
+    '- retry, or fetch a different source, or',
+    '- say plainly which part you could not verify, and what you are relying on instead.',
+  ].join('\n')
 }
 
 /**
@@ -2121,6 +2208,11 @@ export function apply(ctx, config) {
       writes: new Map(),
       history: [],
       lessonRecorded: false,
+      // Request-scoped, and cleared by any successful lookup: what matters is
+      // whether the LAST attempt to settle an external fact actually landed.
+      searchFailed: false,
+      searchReason: '',
+      searchReminded: false,
     }
   }
 
@@ -2174,6 +2266,9 @@ export function apply(ctx, config) {
       writes: new Map(),
       history: [],
       lessonRecorded: false,
+      searchFailed: false,
+      searchReason: '',
+      searchReminded: false,
     }
   }
 
@@ -2220,7 +2315,7 @@ export function apply(ctx, config) {
 
   // Enrich, never veto. Post-execute sees every accepted call, including ones a
   // later listener denies, so the checkpoint cannot be starved by policy.
-  ctx.on('tools/post-execute', async (exec, _result, next) => {
+  ctx.on('tools/post-execute', async (exec, result, next) => {
     // Friction evidence is accumulated here, because this is the only hook that
     // sees every accepted call. Counting only: the guard never inspects whether a
     // call SUCCEEDED, which it cannot know, but it can see the same call twice and
@@ -2238,11 +2333,21 @@ export function apply(ctx, config) {
       // The same calls, in order, so the reminder path and the friction path agree
       // on what "repeated" means instead of each inventing its own idea.
       const history = [...(current.history ?? []), [exec.name, argsOf(exec) ?? {}]].slice(-40)
+      // Did the lookup actually land? The classification is a fact about the tool
+      // result, not a judgement about the claim - see searchOutcome.
+      const outcome = searchOutcome(exec.name, resultText(result))
+      const searchFailed = outcome.status === 'irrelevant'
+        ? (current.searchFailed ?? false)
+        : outcome.status === 'failed'
+      const searchReason = outcome.status === 'failed' ? (outcome.reason ?? 'lookup failed') : ''
       memory.set(exec.agent, {
         ...current,
         calls,
         writes,
         history,
+        searchFailed,
+        searchReason: searchFailed ? searchReason : '',
+        searchReminded: searchFailed ? (current.searchReminded ?? false) : false,
         // The agent recording a lesson is the point of the mechanism, so it is
         // tracked here rather than inferred later from the store's length.
         lessonRecorded: current.lessonRecorded || exec.name === LESSON_TOOL,
@@ -2290,6 +2395,15 @@ export function apply(ctx, config) {
     // Checked BEFORE the contract-shaped gates below: stalling is orthogonal to
     // contracts, and it is most likely exactly when there is no contract at all.
     const stalled = Number.isFinite(state.stalledTurns) ? state.stalledTurns : 0
+    // A failed lookup that nothing has settled since. Checked before the
+    // contract-shaped gates for the same reason the stall check is: it is
+    // orthogonal to contracts, and a wrong answer about the outside world is worse
+    // than an imprecise plan.
+    if (entry.searchFailed === true && entry.searchReminded !== true) {
+      memory.set(agent, { ...spend, steers: steers + 1, searchReminded: true })
+      steer(agent, renderSearchUnverified(entry.searchReason || 'lookup failed'))
+      return
+    }
     if (stalled >= STALL_ESCALATE_AT) {
       if (entry.stallEscalated === true) return
       memory.set(agent, { ...spend, steers: steers + 1, stallEscalated: true })
