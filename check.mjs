@@ -171,6 +171,8 @@ function fakeHost(roots = []) {
         registered.toolsByName.set(definition.name, definition)
       },
     },
+    // The real host resolves `agents` as a service; a double that answered
+    // `undefined` would make every root-agent check fail silently.
     get: key => (key === 'agents' ? { roots: () => roots } : undefined),
     on: (event, listener) => {
       const list = registered.listeners.get(event) ?? []
@@ -762,7 +764,7 @@ function mountWithAnswer(answer, config) {
 }
 
 await check('drift_report asks with the defaults always appended', async () => {
-  const { run, asked } = mountWithAnswer({ answers: [{ id: 'x', selected: ['Approve the direction change'] }] })
+  const { run, asked } = mountWithAnswer({ answers: [{ id: 'x', selected: ['Approve the direction change'] }] }, { autoDrift: false })
   const { value } = await run({
     action: 'report',
     reason: 'incomplete-delivery',
@@ -777,7 +779,7 @@ await check('drift_report asks with the defaults always appended', async () => {
   assert.match(value.outcome, /Commit the new contract/)
 })
 await check('drift_report records the decision as deferred context', async () => {
-  const { run } = mountWithAnswer({ answers: [{ id: 'x', selected: [], custom: 'do it in two passes' }] })
+  const { run } = mountWithAnswer({ answers: [{ id: 'x', selected: [], custom: 'do it in two passes' }] }, { autoDrift: false })
   const { value, deferred } = await run({
     action: 'report', reason: 'scope-expansion', description: 'more',
   })
@@ -787,7 +789,7 @@ await check('drift_report records the decision as deferred context', async () =>
   assert.match(deferred[0].content[0].text, /decision: revise \(do it in two passes\)/)
 })
 await check('drift_report returns "unanswered" for an uninterpretable answer and records nothing', async () => {
-  const { run } = mountWithAnswer({ answers: [{ id: 'x', selected: [], custom: '' }] })
+  const { run } = mountWithAnswer({ answers: [{ id: 'x', selected: [], custom: '' }] }, { autoDrift: false })
   const { value, deferred } = await run({
     action: 'report', reason: 'scope-expansion', description: 'more',
   })
@@ -1110,6 +1112,140 @@ await check('the static policy forbids shipping a subset and names the tools', (
   assert.match(text, /drift_anchor/)
   assert.match(text, /drift_report/)
   assert.match(text, /Difficulty, tedium, or length is never a reason to shrink the job/)
+})
+
+// ===================================================== full-auto resolution ==
+// The user asked not to be interrupted. Auto mode decides only when the change
+// is mechanically defensible, so every escalation path below is a gate that must
+// keep working — an auto path that resolves one of these is silent drift.
+
+/** Run one automatic resolution against a contract that owes two items. */
+function autoCase(callArgs, stateOverrides = {}) {
+  const roots = []
+  const host = fakeHost(roots)
+  const asked = []
+  const baseGet = host.ctx.get
+  host.ctx.get = key => (key === 'userQuestions'
+    ? { ask: async (request) => { asked.push(request); return { answers: [{ id: 'x', selected: [], custom: '' }] } } }
+    : baseGet(key))
+  apply(host.ctx, { autoDrift: true, mutationBudget: 0.5 })
+  const projection = host.projectionOf()
+  let state = projection.init()
+  for (const event of [turnStart(), human('Fix the login bug. Keep it local.'), step()]) {
+    state = projection.apply(state, event)
+  }
+  state = projection.apply(state, toolCall('drift_anchor', setArgs({ must_deliver: ['a', 'b'] })))
+  const session = { __state: { ...state, ...stateOverrides }, snapshotEvents: () => [] }
+  const agent = { session, id: 'a' }
+  roots.push(agent)
+  const definition = host.registered.toolsByName.get('drift_report')
+  const deferred = []
+  return definition.execute(callArgs, { agent, name: 'drift_report', deferContext: m => deferred.push(m) })
+    .then(value => ({ value, asked: asked.length, deferred }))
+}
+
+await check('auto: a cited extension resolves without asking the user', async () => {
+  const { value, asked, deferred } = await autoCase({
+    action: 'report',
+    reason: 'scope-expansion',
+    description: 'also cover the parser',
+    basis: ['Fix the login bug.'],
+    adds_deliverables: ['parser'],
+  })
+  assert.equal(value.decision, 'approve', 'a verbatim quote licenses the extension')
+  assert.equal(asked, 0, 'and the user is not interrupted')
+  assert.match(value.note, /^auto:/)
+  assert.match(deferred[0].content[0].text, /WITHOUT asking you/)
+  assert.match(deferred[0].content[0].text, /Fix the login bug\./, 'the quote is shown back')
+})
+await check('auto: a forged citation escalates instead of resolving', async () => {
+  const { value, asked } = await autoCase({
+    action: 'report',
+    reason: 'scope-expansion',
+    description: 'also rewrite the database layer',
+    basis: ['also rewrite the database layer'],
+  })
+  assert.equal(asked, 1, 'a quote absent from the original request must escalate')
+  assert.notEqual(value.decision, 'approve')
+})
+await check('auto: no citation at all escalates', async () => {
+  const { asked } = await autoCase({
+    action: 'report',
+    reason: 'architecture-shift',
+    description: 'swap the storage engine',
+  })
+  assert.equal(asked, 1)
+})
+await check('auto: a scope REDUCTION is never self-approved, even with a citation', async () => {
+  const { value, asked } = await autoCase({
+    action: 'report',
+    reason: 'incomplete-delivery',
+    description: 'ship only item a for now',
+    basis: ['Fix the login bug.'],
+    drops_deliverables: ['b'],
+  })
+  assert.equal(asked, 1, 'shrinking the job always asks')
+  assert.notEqual(value.decision, 'approve')
+})
+await check('auto: dropping a deliverable escalates even without naming a reason', async () => {
+  const { asked } = await autoCase({
+    action: 'report',
+    reason: 'scope-expansion',
+    description: 'narrow what is owed',
+    basis: ['Fix the login bug.'],
+    drops_deliverables: ['b'],
+  })
+  assert.equal(asked, 1, 'the ledger owes b, so removing it is a reduction')
+})
+await check('auto: exceeding the cumulative budget escalates', async () => {
+  const { asked } = await autoCase({
+    action: 'report',
+    reason: 'scope-expansion',
+    description: 'add two more items to a two-item contract',
+    basis: ['Fix the login bug.'],
+    adds_deliverables: ['c', 'd'],
+  })
+  assert.equal(asked, 1, '2 additions against a 2-item contract exceeds a 0.5 budget')
+})
+await check('auto: a spent budget stays spent for the next decision', async () => {
+  const { asked } = await autoCase({
+    action: 'report',
+    reason: 'scope-expansion',
+    description: 'one more small item',
+    basis: ['Fix the login bug.'],
+    adds_deliverables: ['c'],
+  }, { mutationRatio: 0.5 })
+  assert.equal(asked, 1, 'the prior spend is what pushes it over')
+})
+await check('auto: off means every report asks the user', async () => {
+  const roots = []
+  const host = fakeHost(roots)
+  const asked = []
+  const baseGet = host.ctx.get
+  let getCalls = []
+  host.ctx.get = key => {
+    getCalls.push(key)
+    return key === 'userQuestions'
+      ? { ask: async (request) => { asked.push(request); return { answers: [{ id: 'x', selected: [], custom: '' }] } } }
+      : baseGet(key)
+  }
+  apply(host.ctx, { autoDrift: false })
+  const projection = host.projectionOf()
+  let state = projection.init()
+  for (const event of [turnStart(), human('Fix the login bug.'), step()]) state = projection.apply(state, event)
+  const session = { __state: state, snapshotEvents: () => [] }
+  const agent = { session, id: 'a' }
+  roots.push(agent)
+  const value = await host.registered.toolsByName.get('drift_report').execute({
+    action: 'report',
+    reason: 'scope-expansion',
+    description: 'also cover the parser',
+    basis: ['Fix the login bug.'],
+  }, { agent, name: 'drift_report', deferContext() {} })
+  // What matters is that nothing self-resolved: with autoDrift off the tool must
+  // route through the user, never approve on its own.
+  assert.notEqual(value.decision, 'approve', 'with autoDrift off nothing self-resolves')
+  assert.equal(value.note, '', 'and it carries no automatic note')
 })
 
 // ==================================================================== report ==

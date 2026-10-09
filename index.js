@@ -104,6 +104,84 @@ const COVERAGE_STATES = ['complete', 'partial', 'missing', 'waived']
 const AUTHORIZED_VERDICTS = ['complete', 'waived']
 
 /**
+ * Reasons whose automatic resolution is a scope REDUCTION. Never self-approved,
+ * even in full-auto mode: dropping a deliverable is the failure mode the ledger
+ * exists to catch, and no citation can authorize it because the user never asked
+ * for less.
+ */
+const REDUCING_REASONS = ['incomplete-delivery', 'constraint-conflict']
+
+/**
+ * Upper bound on the cumulative share of the contract that automatic decisions
+ * may add before every further decision escalates to the user.
+ *
+ * The measure is a RATIO, not a count. Dividing by the current deliverable count
+ * lets a larger contract absorb more individual additions, so "just one more
+ * item" cannot accumulate without bound. Deliberately structural rather than a
+ * semantic drift score: semantic scoring was measured to have no discriminative
+ * power (see README), while counting declared items is exact.
+ */
+const DEFAULT_MUTATION_BUDGET = 0.5
+
+// ------------------------------------------------------ automatic resolution --
+
+/**
+ * Gate A - citation authorization.
+ *
+ * Every self-resolved scope extension must quote the ORIGINAL request verbatim.
+ * Quotes are checked as literal substrings of the baseline text, which the agent
+ * cannot rewrite. Drifting therefore requires forging a quotation, and a forged
+ * quotation is a visible failure rather than a silent one.
+ */
+function citedBasis(basis, baseline) {
+  if (baseline === null || baseline.text.length === 0) return undefined
+  const accepted = []
+  for (const quote of basis) {
+    const needle = quote.trim()
+    if (needle.length < 3) continue
+    if (baseline.text.includes(needle)) accepted.push(needle)
+  }
+  return accepted.length === 0 ? undefined : accepted
+}
+
+/** Human-readable reason a decision could not be self-resolved. */
+function escalationReason(kind) {
+  if (kind === 'reducing') {
+    return 'this would REDUCE what the contract owes, and the user never asked for less'
+  }
+  if (kind === 'no-citation') {
+    return 'no supplied quote appears verbatim in the original request, so this is a new goal rather '
+      + 'than a licensed extension'
+  }
+  return 'the cumulative automatic-change budget for this request is spent'
+}
+
+/**
+ * Gates B and C for one automatic resolution.
+ *
+ * B - scope may only grow: dropping a previously owed item is a reduction and
+ *     escalates. Exact set membership, no judgement.
+ * C - cumulative mutation budget as a RATIO of the contract's size.
+ */
+function autoResolution(state, resolved, args) {
+  if (REDUCING_REASONS.includes(args.reason)) return { kind: 'reducing' }
+  const contract = state.contract
+  const added = strings(args.adds_deliverables)
+  const dropped = strings(args.drops_deliverables)
+  if (contract !== null && dropped.length > 0) {
+    const owed = contract.mustDeliver.filter(item => dropped.includes(item))
+    if (owed.length > 0) return { kind: 'reducing' }
+  }
+  const accepted = citedBasis(strings(args.basis), state.baseline)
+  if (accepted === undefined) return { kind: 'no-citation' }
+  const size = Math.max(1, contract?.mustDeliver.length ?? 1)
+  const delta = added.length / size
+  const prior = Number.isFinite(state.mutationRatio) ? state.mutationRatio : 0
+  if (prior + delta > resolved.mutationBudget) return { kind: 'over-budget' }
+  return { kind: 'allow', accepted, mutationDelta: delta }
+}
+
+/**
  * Deferral-phrase detection. **Off by default**, and this is a measured
  * decision rather than a conservative one.
  *
@@ -169,6 +247,8 @@ export function resolveConfig(config) {
     requireCoverage: raw.requireCoverage ?? true,
     blockUnfinished: raw.blockUnfinished ?? true,
     reportDeferrals: raw.reportDeferrals ?? false,
+    autoDrift: raw.autoDrift ?? true,
+    mutationBudget: raw.mutationBudget ?? DEFAULT_MUTATION_BUDGET,
   }
   for (const key of ['stepBudget', 'askAnchorAt']) {
     const value = resolved[key]
@@ -182,7 +262,7 @@ export function resolveConfig(config) {
       throw new Error(`drift-guard: ${key} must be a non-negative safe integer, got ${String(value)}`)
     }
   }
-  for (const key of ['requireCoverage', 'blockUnfinished', 'reportDeferrals']) {
+  for (const key of ['requireCoverage', 'blockUnfinished', 'reportDeferrals', 'autoDrift']) {
     if (typeof resolved[key] !== 'boolean') {
       throw new Error(`drift-guard: ${key} must be a boolean, got ${typeof resolved[key]}`)
     }
@@ -317,6 +397,8 @@ function initialState() {
     decisionSeq: null,
     steps: 0,
     turn: 0,
+    /** Cumulative share of the contract added by automatic decisions. */
+    mutationRatio: 0,
     /** Closed steps taken within the current request, reset by a new baseline. */
     stepsThisTurn: 0,
     /**
@@ -417,6 +499,7 @@ function parseState(value) {
     decisionSeq: Number.isFinite(raw.decisionSeq) ? raw.decisionSeq : null,
     steps: count(raw.steps, 0),
     turn: count(raw.turn, 0),
+    mutationRatio: Number.isFinite(raw.mutationRatio) && raw.mutationRatio >= 0 ? raw.mutationRatio : 0,
     stepsThisTurn: count(raw.stepsThisTurn, 0),
     askedAnchorAtTurn: Number.isFinite(raw.askedAnchorAtTurn) ? raw.askedAnchorAtTurn : null,
   }
@@ -668,6 +751,13 @@ function projectionDefinition(options = {}) {
           if (args.action === 'decide' && ['approve', 'reject', 'revise'].includes(args.decision)) {
             return {
               ...state,
+              // Gate C accounting: a self-resolved approval adds its share to the
+              // cumulative ratio, so repeated small changes converge on the budget
+              // instead of accumulating unnoticed.
+              mutationRatio: typeof args.note === 'string' && args.note.startsWith('auto:')
+                ? (Number.isFinite(state.mutationRatio) ? state.mutationRatio : 0)
+                  + (strings(args.adds_deliverables).length / Math.max(1, state.contract?.mustDeliver.length ?? 1))
+                : state.mutationRatio,
               decision: {
                 decision: args.decision,
                 note: typeof args.note === 'string' && args.note.trim().length > 0 ? args.note.trim() : null,
@@ -1206,6 +1296,11 @@ function validateDriftArgs(args) {
     description: raw.description.trim(),
     required_change: requiredChange.length === 0 ? undefined : requiredChange,
     options: validateOptions(raw.options),
+    // Gate inputs. Supplying them makes a self-resolved change possible; omitting
+    // them simply escalates to the user, which is always safe.
+    basis: strings(raw.basis),
+    adds_deliverables: strings(raw.adds_deliverables),
+    drops_deliverables: strings(raw.drops_deliverables),
   }
 }
 
@@ -1462,6 +1557,45 @@ export function apply(ctx, config) {
       if (agent === undefined) throw new Error(`${DRIFT_TOOL} requires a calling agent`)
       const requested = validateDriftArgs(args)
       if (!isRootAgent(ctx, agent)) throw delegatedRefusal(DRIFT_TOOL)
+
+      // Full-auto resolution. The user asked not to be interrupted, so this path
+      // decides - but only when the change is mechanically defensible: it is not a
+      // reduction, it quotes the original request verbatim, and the cumulative
+      // automatic-change budget is not spent. Anything else falls through to the
+      // question, so auto mode can never silently shrink the job.
+      if (resolved.autoDrift && !hasDirectHumanInput(ctx, agent)) {
+        const state = stateOf(ctx, agent) ?? initialState()
+        const verdict = autoResolution(state, resolved, requested)
+        if (verdict.kind === 'allow') {
+          const prior = Number.isFinite(state.mutationRatio) ? state.mutationRatio : 0
+          const ratio = prior + verdict.mutationDelta
+          exec.deferContext(contextMessage([
+            'drift-guard resolved a direction change WITHOUT asking you:',
+            `- reason: ${requested.reason}`,
+            `- what it will do: ${requested.description}`,
+            requested.required_change === undefined ? '' : `- contract change: ${requested.required_change}`,
+            `- authorized by the original request, quoted verbatim: ${verdict.accepted.join(' | ')}`,
+            `- cumulative automatic-change ratio after this: ${(ratio * 100).toFixed(0)}%`,
+            `- next: commit the new contract with ${ANCHOR_TOOL} action "set"`,
+          ].filter(line => line !== '').join('\n'), 'notice',
+          `auto-resolved ${requested.reason}: ${requested.description}`))
+          return {
+            action: 'report',
+            reason: requested.reason,
+            description: requested.description,
+            decision: 'approve',
+            note: `auto: ${verdict.accepted.length} quote(s); ratio ${(ratio * 100).toFixed(0)}%`,
+            outcome: 'Resolved automatically from a verbatim quote of the original request. Commit the '
+              + `new contract with ${ANCHOR_TOOL} action "set", then continue.`,
+          }
+        }
+        exec.deferContext(contextMessage(
+          `drift-guard could NOT resolve this automatically and is asking you: ${escalationReason(verdict.kind)}.\n`
+          + `- reason: ${requested.reason}\n- what it wants to do: ${requested.description}`,
+          'notice',
+          `escalated ${requested.reason}: ${verdict.kind}`,
+        ))
+      }
 
       const presented = withDefaultOptions(requested.options)
       const userQuestions = ctx.get('userQuestions')
