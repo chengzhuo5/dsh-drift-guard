@@ -166,6 +166,12 @@ const COVERAGE_STATES = ['complete', 'partial', 'missing', 'waived']
 //   - An edit that changes any pinned hash is REJECTED, not warned about.
 const POLICY = {
   stepBudget: 30,
+  /** Steps granted per plan item when a budget is derived from a todo list. */
+  budgetStepsPerItem: 4,
+  /** Steps withheld from a derived budget so the commit is not the thing that gets cut. */
+  commitReserveSteps: 3,
+  /** Steps after which a long turn with no todo list at all is asked to plan. */
+  planBySteps: 8,
   maxCheckpointsPerTurn: 2,
   maxCheckpointMessages: 3,
   askAnchorAt: 2,
@@ -1666,6 +1672,10 @@ export {
   deferralMarkers,
   parseState,
   searchOutcome,
+  deriveBudget,
+  outstandingPlan,
+  BUDGET_STEPS_PER_ITEM,
+  COMMIT_RESERVE_STEPS,
   anchorValue,
   POLICY,
   FROZEN_CORE_NAMES,
@@ -1733,6 +1743,97 @@ function resultText(result) {
       .join('')
   }
   return ''
+}
+
+/** Steps granted per plan item, mirroring POLICY.budgetStepsPerItem. */
+const BUDGET_STEPS_PER_ITEM = 4
+/** Steps withheld so the commit is not the thing that gets cut, mirroring POLICY. */
+const COMMIT_RESERVE_STEPS = 3
+/** A plan item marked like this is an answer, not a silent drop. */
+const WAIVED_MARK = /\[waived\b/i
+
+/**
+ * A budget derived from the agent's own plan instead of a fixed number.
+ *
+ * Measured steps-per-item in the real logs: median 21, mean 73 - both describe
+ * someone else's project, so they are not the coefficient. What is defensible is
+ * the SHAPE: a budget that grows with the plan and always withholds a fixed
+ * reserve. The reserve is the honest part - the guard cannot reserve steps from
+ * outside, so it SUBTRACTS them from what the plan may consume, which is the only
+ * mechanical way to keep the commit from being what gets cut.
+ *
+ * @returns {number|undefined} undefined when there is no plan to derive from.
+ */
+function deriveBudget(todos) {
+  if (!Array.isArray(todos) || todos.length === 0) return undefined
+  const granted = todos.length * BUDGET_STEPS_PER_ITEM - COMMIT_RESERVE_STEPS
+  return Math.max(granted, COMMIT_RESERVE_STEPS + 1)
+}
+
+/**
+ * The plan items the agent itself declared unfinished.
+ *
+ * It reads the same 'todos' projection the built-in todo_write tool feeds, so the
+ * guard holds the agent to its own words rather than to an opinion of its own. A
+ * waived marker in the content counts as an answer: the point is that nothing
+ * closes SILENTLY, not that everything must be finished.
+ */
+function outstandingPlan(todos) {
+  if (!Array.isArray(todos)) return []
+  return todos.filter(item => {
+    const status = item?.status
+    if (status === 'completed') return false
+    const content = String(item?.content ?? '')
+    if (WAIVED_MARK.test(content)) return false
+    return true
+  })
+}
+
+/** Read the agent's plan, or undefined when this composition has no todo unit. */
+function planOf(ctx, agent) {
+  try {
+    const todos = ctx.sessionProjections?.stateOf?.(agent?.session, 'todos')
+    return Array.isArray(todos) ? todos : undefined
+  } catch {
+    // A composition without the todo unit must not take the guard down.
+    return undefined
+  }
+}
+
+/**
+ * The plan is the agent's own; closing with it unfinished is measured behaviour.
+ *
+ * 19 of the 49 real sessions that wrote a todo list (39%) closed with items still
+ * pending or in progress. The list already existed - what did not exist was
+ * anything making it binding, because todo_write is a voluntary write.
+ */
+function renderPlanOutstanding(items) {
+  const named = items.slice(0, 6).map(item => `- ${String(item?.content ?? '').slice(0, 90)}`)
+  const more = items.length > named.length ? `- ...and ${items.length - named.length} more` : ''
+  return [
+    `drift-guard: closing with ${items.length} item(s) of your OWN plan unfinished.`,
+    '',
+    ...named,
+    ...(more === '' ? [] : [more]),
+    '',
+    'You wrote this list. Nothing here is the guard opinion of the work - it is what you',
+    'said was left. Two exits, both answers:',
+    '- finish it, or',
+    '- mark it waived with a reason and say why it is being dropped.',
+    '',
+    'This is not blocking the turn. It is refusing to let the list quietly stop meaning anything.',
+  ].join('\n')
+}
+
+/** A long turn that never planned is the case the plan-first rule exists for. */
+function renderPlanFirst(steps) {
+  return [
+    `drift-guard: ${steps} steps in and there is no task list.`,
+    '',
+    'On a turn this long, a list is what keeps the original request in view - and it is also',
+    'the only thing that lets this guard hold you to a plan. Write one with todo_write, then',
+    'carry on. This is asked once.',
+  ].join('\n')
 }
 
 /**
@@ -2269,6 +2370,8 @@ export function apply(ctx, config) {
       searchFailed: false,
       searchReason: '',
       searchReminded: false,
+      planReminded: false,
+      planFirstAsked: false,
     }
   }
 
@@ -2394,6 +2497,25 @@ export function apply(ctx, config) {
     // normal concluding turn - which always followed real work - never trips this.
     // Checked BEFORE the contract-shaped gates below: stalling is orthogonal to
     // contracts, and it is most likely exactly when there is no contract at all.
+    // The agent's own plan, before anything the guard believes. Checked ahead of the
+    // contract gates because it is likewise orthogonal: whatever the contract says,
+    // the agent already wrote down what it had not done. 39% of real sessions that
+    // planned closed with items outstanding, so this is measured, not hypothetical.
+    const todos = planOf(ctx, agent)
+    const outstanding = outstandingPlan(todos)
+    if (outstanding.length > 0 && entry.planReminded !== true) {
+      memory.set(agent, { ...spend, steers: steers + 1, planReminded: true })
+      steer(agent, renderPlanOutstanding(outstanding))
+      return
+    }
+    // No plan at all on a long turn: the plan-first rule, asked once.
+    const planSteps = Number.isFinite(state.stepsThisTurn) ? state.stepsThisTurn : 0
+    if (todos === undefined && planSteps >= resolved.planBySteps && entry.planFirstAsked !== true) {
+      memory.set(agent, { ...spend, steers: steers + 1, planFirstAsked: true })
+      steer(agent, renderPlanFirst(planSteps))
+      return
+    }
+
     const stalled = Number.isFinite(state.stalledTurns) ? state.stalledTurns : 0
     // A failed lookup that nothing has settled since. Checked before the
     // contract-shaped gates for the same reason the stall check is: it is

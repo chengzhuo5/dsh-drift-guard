@@ -26,6 +26,10 @@ import {
   deferralMarkers,
   parseState,
   searchOutcome,
+  deriveBudget,
+  outstandingPlan,
+  BUDGET_STEPS_PER_ITEM,
+  COMMIT_RESERVE_STEPS,
 } from './index.js'
 
 const failures = []
@@ -1857,6 +1861,58 @@ await check('search: a non-search tool failure never triggers it', async () => {
   const { unverified } = await searchTurn([['read', 'Error: ENOENT no such file']])
   assert.equal(unverified.length, 0, 'a failed file read is not an unverified fact')
 })
+
+// ================================================ the plan must be honoured ==
+// Measured: of the 49 real sessions that wrote a todo list, 19 (39%) closed with
+// items still pending or in progress. The list already existed - what did not
+// exist was anything that made it binding. todo_write is a voluntary write.
+//
+// So the guard reads the same 'todos' projection the built-in tool feeds, and will
+// not let a request close with work the agent itself declared unfinished unless it
+// says so out loud.
+
+const ITEM = (content, status) => ({ content, status })
+
+await check('plan: a fully completed list has nothing outstanding', () => {
+  const done = [ITEM('read the spec', 'completed'), ITEM('write the fix', 'completed')]
+  assert.deepEqual(outstandingPlan(done), [], 'nothing outstanding, nothing to say')
+})
+await check('plan: a pending item is reported, not dropped', () => {
+  const open = [ITEM('read the spec', 'completed'), ITEM('write the fix', 'pending')]
+  const out = outstandingPlan(open)
+  assert.equal(out.length, 1, 'the agent declared this unfinished itself')
+  assert.match(out[0].content, /write the fix/, 'and it is named')
+})
+await check('plan: an in_progress item counts as unfinished too', () => {
+  assert.equal(outstandingPlan([ITEM('half done', 'in_progress')]).length, 1,
+    'in progress at closing time is still not finished')
+})
+await check('plan: an explicit waiver is an answer, not a silent drop', () => {
+  const waived = [ITEM('write the fix [waived: user said ship it]', 'pending')]
+  assert.deepEqual(outstandingPlan(waived), [], 'a stated reason settles it')
+})
+await check('plan: no list at all owes no plan', () => {
+  assert.deepEqual(outstandingPlan(undefined), [], 'an agent that never planned owes nothing')
+  assert.deepEqual(outstandingPlan(null), [], 'and null is the same case')
+  assert.deepEqual(outstandingPlan([]), [], 'an empty list is not an unfinished one')
+})
+await check('plan: every outstanding item is enumerated', () => {
+  const many = Array.from({ length: 9 }, (_, i) => ITEM(`t${i}`, 'pending'))
+  assert.equal(outstandingPlan(many).length, 9, 'the count is the whole list, not a sample')
+})
+
+await check('budget: the plan derives the step budget and keeps a commit reserve', () => {
+  // Measured steps-per-item across real sessions: median 21, mean 73 - both
+  // describe someone else's project. What is enforceable here is only the SHAPE:
+  // a budget that grows with the plan, minus a reserve for the commit.
+  const small = deriveBudget([ITEM('a', 'pending'), ITEM('b', 'pending')])
+  const big = deriveBudget(Array.from({ length: 10 }, (_, i) => ITEM(`t${i}`, 'pending')))
+  assert.ok(big > small, 'a bigger plan earns a bigger budget')
+  assert.ok(small >= COMMIT_RESERVE_STEPS, 'never derails below the commit reserve')
+  assert.equal(small, 2 * BUDGET_STEPS_PER_ITEM - COMMIT_RESERVE_STEPS, 'shape: items x cost - reserve')
+  assert.equal(deriveBudget(null), undefined, 'no plan, no derived budget')
+})
+
 
 // ==================================================================== report ==
 
