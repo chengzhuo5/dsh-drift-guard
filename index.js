@@ -516,6 +516,10 @@ function initialState() {
   decorationUnits: 0,
   /** True while every message this turn only asked, and none delivered. */
   questionsOnly: true,
+  /** Whether the question tool ran this turn. Using it IS the correct form. */
+  usedQuestionTool: false,
+  /** The last assistant text of the turn, inspected by the closing hook. */
+  lastAssistantText: '',
     /**
      * The turn key the guard itself asked for a contract in. `null` means it
      * has not asked yet; recording the key keeps the ask one-shot WITHOUT
@@ -627,6 +631,10 @@ function parseState(value) {
     // and both turn/start and any substantive message reset it. Persisting it would
     // make a stale false outlive its turn, so it is dropped here and re-derived.
     questionsOnly: true,
+    // Also transient, also re-derived: both turn/start and the tool-call fold set
+    // these, so a persisted copy would outlive the turn it describes.
+    usedQuestionTool: false,
+    lastAssistantText: '',
 
     askedAnchorAtTurn: Number.isFinite(raw.askedAnchorAtTurn) ? raw.askedAnchorAtTurn : null,
   }
@@ -771,6 +779,9 @@ function projectionDefinition(options = {}) {
         case 'user/message': {
           // A stall streak belongs to the request it happened in.
           if (event.data?.source?.kind === 'user') state = { ...state, stalledTurns: 0 }
+          if (event.type === 'turn/start') {
+            state = { ...state, questionsOnly: true, usedQuestionTool: false }
+          }
           // The guard's own ask for a contract is recorded so it happens once
           // per request rather than once per step.
           if (event.data?.source?.kind === name) {
@@ -840,14 +851,24 @@ function projectionDefinition(options = {}) {
           // deferral check returns early - the costume is worth counting whether or
           // not deferral detection is switched on.
           {
-            const density = decorationDensity(textOfMessage(event.data?.message))
+            const said_text = textOfMessage(event.data?.message)
+            const density = decorationDensity(said_text)
             if (density.chars >= 200) {
               state = { ...state, decorationUnits: (state.decorationUnits ?? 0) + density.per1000 }
             }
             // "A question is not a delivery": sticky for the turn. One substantive
             // message clears it, so only a turn that did nothing AND asked is caught.
-            const said = questionOnly(textOfMessage(event.data?.message))
-            if (said.hasSubstance) state = { ...state, questionsOnly: false }
+            if (questionOnly(said_text).hasSubstance && state.questionsOnly !== false) {
+              state = { ...state, questionsOnly: false }
+            }
+            // Keep the last thing said, so the closing hook can inspect how the turn
+            // ended - it receives the agent, not an event. Compare before assigning:
+            // an uninteresting event must keep the SAME reference, which is part of
+            // this projection's contract, and blanket-cloning broke that.
+            const tail = said_text.slice(0, 4000)
+            if (tail !== state.lastAssistantText) {
+              state = { ...state, lastAssistantText: tail }
+            }
           }
           // Deferral-phrase detection is off by default (see DEFERRAL_MARKERS):
           // three live runs produced three false positives, because real text is
@@ -867,6 +888,11 @@ function projectionDefinition(options = {}) {
           // Counted before any filtering: what matters is that a tool ran, not
           // which one. A guard tool call is still the agent doing something.
           state = { ...state, toolsThisTurn: state.toolsThisTurn + 1, stalledTurns: 0 }
+          // Using the question tool is the CORRECT way to hand a decision over, so
+          // whether it ran is what decides if the prose-question reminder applies.
+          if (/^(ask_user_question|ask_user|question)$/i.test(String(event.data?.name ?? ''))) {
+            state = { ...state, usedQuestionTool: true }
+          }
           const name = event.data?.name
           if (name !== ANCHOR_TOOL && name !== DRIFT_TOOL) return state
           const args = argsOf(event)
@@ -1699,6 +1725,8 @@ export {
   outstandingPlan,
   BUDGET_STEPS_PER_ITEM,
   COMMIT_RESERVE_STEPS,
+  proseQuestion,
+  renderProseQuestionNotice,
   questionOnly,
   renderQuestionOnlyNotice,
   decorationDensity,
@@ -1860,6 +1888,57 @@ function renderPlanFirst(steps) {
     'On a turn this long, a list is what keeps the original request in view - and it is also',
     'the only thing that lets this guard hold you to a plan. Write one with todo_write, then',
     'carry on. This is asked once.',
+  ].join('\n')
+}
+
+/**
+ * Asking the user to decide, in prose, instead of through the question tool.
+ *
+ * This replaces an earlier condition that required ZERO tool calls that turn. The
+ * user then showed a real failure: a model used drift_anchor and wrote scratch
+ * files, and ended with "please rule on the eleven items above" in the body - and
+ * the guard stayed silent, because that turn HAD used tools. The condition was
+ * simply too narrow. Whether a decision was handed over in prose has nothing to do
+ * with how many other tools ran.
+ */
+function proseQuestion(text) {
+  const raw = typeof text === 'string' ? text : ''
+  if (raw.trim().length === 0) return { asks: false, evidence: '' }
+  const prose = raw.replace(new RegExp(FENCED_CODE.source, 'gm'), '')
+  const handover = /(should i|shall i|do you want|would you like|which (one|option)|let me know|your call|you decide|please (rule|decide|pick|choose)|waiting for|may i)\b/i
+  const handoverZh = /(要(不要|不)我|你(来)?(拍板|决定|定)|请你(裁定|决定|选)|回我(裁定|决定)|等你(点头|确认|回复)|要不要|选哪(个|一))/
+  // Questions aimed at the code or at the guard's own reasoning are not handovers.
+  const rhetorical = /\b(why|what|how) (does|do|is|are|would)\b|为什么|怎么会/.test(prose)
+  const secondPerson = /\byou\b|你/.test(prose)
+  const asked = /\?|？/.test(raw)
+  const explicit = handover.test(prose) || handoverZh.test(prose)
+  if (!explicit) {
+    if (rhetorical || !(asked && secondPerson)) return { asks: false, evidence: '' }
+  }
+  const lines = raw.split('\n').map(part => part.trim())
+  const evidence =
+    lines.find(part => handover.test(part) || handoverZh.test(part)) ??
+    lines.filter(part => /\?|？/.test(part)).pop() ??
+    ''
+  return { asks: true, evidence: evidence.slice(0, 200) }
+}
+
+/**
+ * The correction is to use the question tool, which stops and waits, rather than
+ * writing the question into the body and leaving the turn idle.
+ */
+function renderProseQuestionNotice(evidence) {
+  return [
+    'drift-guard: this turn handed a decision to the user in prose.',
+    '',
+    evidence ? `Asking: ${evidence}` : '',
+    '',
+    'The user asked for this explicitly. A decision that needs the human goes through',
+    'ask_user_question, which STOPS and waits. Writing it in the reply body does not ask',
+    '- it ends the turn and leaves the decision hanging.',
+    '',
+    'Either ask with the question tool, or do it if the requirement is already clear.',
+    'This is asked once and blocks nothing.',
   ].join('\n')
 }
 
@@ -2677,6 +2756,19 @@ export function apply(ctx, config) {
       memory.set(agent, { ...spend, steers: steers + 1, planFirstAsked: true })
       steer(agent, renderPlanFirst(planSteps))
       return
+    }
+
+    // Handing a decision to the user in prose. This is NOT gated on toolsThisTurn:
+    // the user's failing example used drift_anchor and wrote scratch files, then
+    // ended with "please rule on the eleven items" in the body, and the earlier
+    // zero-tool-calls condition let it through untouched.
+    {
+      const prose = proseQuestion(state.lastAssistantText)
+      if (prose.asks && state.usedQuestionTool !== true && entry.proseQuestionReminded !== true) {
+        memory.set(agent, { ...spend, steers: steers + 1, proseQuestionReminded: true })
+        steer(agent, renderProseQuestionNotice(prose.evidence))
+        return
+      }
     }
 
     // Decoration: costumes per character, not words. Length was flat while table

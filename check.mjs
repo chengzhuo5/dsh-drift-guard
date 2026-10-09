@@ -30,6 +30,8 @@ import {
   outstandingPlan,
   BUDGET_STEPS_PER_ITEM,
   COMMIT_RESERVE_STEPS,
+  proseQuestion,
+  renderProseQuestionNotice,
   questionOnly,
   renderQuestionOnlyNotice,
   decorationDensity,
@@ -2014,6 +2016,49 @@ await check('question: the reminder points at the tool, not at more prose', () =
   const notice = renderQuestionOnlyNotice()
   assert.match(notice, /ask_user_question|question tool/i)
   assert.match(notice, /do not/i)
+  assert.match(notice, /block/i)
+})
+
+// ============== asking in prose instead of using the question tool ==========
+// The user showed a real failure: a model admitted "no good reason" for not using
+// the question tool, and a second run ended with "please rule on the eleven items
+// above" written in the body. My first check required ZERO tool calls that turn,
+// but that turn used tools - so the guard stayed silent while the exact behaviour
+// the user objected to happened. The condition was simply too narrow.
+//
+// The right test is not "did the turn do nothing". It is: did the turn hand a
+// decision to the user in prose, WITHOUT going through the question tool? Other
+// tool calls are irrelevant to that question.
+
+await check('prose: an explicit request for a ruling is caught', () => {
+  assert.equal(proseQuestion('请按上面十一条回我裁定，可以只回「除某条外都用你的建议」。').asks, true)
+  assert.equal(proseQuestion('Should I use D1 or D2?').asks, true)
+  assert.equal(proseQuestion('要不要我改成绝对路径？').asks, true)
+  assert.equal(proseQuestion('Which one do you want?').asks, true)
+})
+await check('prose: handing the choice back is caught', () => {
+  assert.equal(proseQuestion('交你拍板。').asks, true)
+  assert.equal(proseQuestion('你点头后我就开工，要我继续吗？').asks, true)
+  assert.equal(proseQuestion('Let me know which option you prefer.').asks, true)
+})
+await check('prose: a question about the code is NOT asking the user to decide', () => {
+  // These are the false positives that would make the reminder noise.
+  assert.equal(proseQuestion('The parser returns rows - why does it stop at a blank line?').asks, false)
+  assert.equal(proseQuestion('Is this the same bug as before? Yes, it is.').asks, false)
+})
+await check('prose: a plain report with no question is silent', () => {
+  assert.equal(proseQuestion('Done. The suite is green and the commit is pushed.').asks, false)
+  assert.equal(proseQuestion('已完成，套件全绿，已推送。').asks, false)
+})
+await check('prose: it names the offending sentence as evidence', () => {
+  const found = proseQuestion('Everything is fixed.\n\nShould I also update the docs?')
+  assert.equal(found.asks, true)
+  assert.match(found.evidence, /update the docs/, 'the sentence is quoted back, not just a flag')
+})
+await check('template: the reminder points at the tool and blocks nothing', () => {
+  const notice = renderProseQuestionNotice('Should I also update the docs?')
+  assert.match(notice, /ask_user_question|question tool/i)
+  assert.match(notice, /update the docs/, 'the evidence appears in the reminder')
   assert.match(notice, /block/i)
 })
 
