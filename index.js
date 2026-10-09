@@ -249,6 +249,8 @@ export function resolveConfig(config) {
     reportDeferrals: raw.reportDeferrals ?? false,
     autoDrift: raw.autoDrift ?? true,
     mutationBudget: raw.mutationBudget ?? DEFAULT_MUTATION_BUDGET,
+    reportContextUsage: raw.reportContextUsage ?? true,
+    contextPressureWarnAt: raw.contextPressureWarnAt ?? 80,
   }
   for (const key of ['stepBudget', 'askAnchorAt']) {
     const value = resolved[key]
@@ -262,7 +264,7 @@ export function resolveConfig(config) {
       throw new Error(`drift-guard: ${key} must be a non-negative safe integer, got ${String(value)}`)
     }
   }
-  for (const key of ['requireCoverage', 'blockUnfinished', 'reportDeferrals', 'autoDrift']) {
+  for (const key of ['requireCoverage', 'blockUnfinished', 'reportDeferrals', 'autoDrift', 'reportContextUsage']) {
     if (typeof resolved[key] !== 'boolean') {
       throw new Error(`drift-guard: ${key} must be a boolean, got ${typeof resolved[key]}`)
     }
@@ -786,6 +788,53 @@ function projectionDefinition(options = {}) {
 // ------------------------------------------------------------------ context --
 
 /** Build one plugin-attributed user message. The runtime freezes what it accepts. */
+/**
+ * Current context occupancy, read from DSH's own token-meter projection.
+ *
+ * Deliberately NOT estimated here: DSH already measures this, and a second
+ * estimator built from a different definition would disagree with the number the
+ * user sees in the UI. `projectedTokens` is what the token meter itself calls
+ * "what the NEXT request's prompt would cost"; `pressureTokens` is the fallback
+ * when no surface movement has been sampled since the last reading.
+ *
+ * @returns the usage line, or undefined when the meter has not reported yet.
+ * Nothing is invented in that case - a fabricated number would be worse than no
+ * number, because a wrong occupancy reading cannot be told apart from a right one.
+ */
+function renderContextUsage(ctx, agent, state, resolved) {
+  if (!resolved.reportContextUsage) return undefined
+  const pressure = ctx.sessionProjections?.stateOf?.(agent.session, 'contextPressure')
+  if (pressure === null || typeof pressure !== 'object') return undefined
+  const used = pressure.projectedTokens ?? pressure.pressureTokens
+  const window = pressure.contextWindow
+  if (typeof used !== 'number' || !Number.isFinite(used)) return undefined
+  if (typeof window !== 'number' || !Number.isFinite(window) || window <= 0) {
+    // The meter has started reporting but the window is not known yet. Say the
+    // reading is degraded instead of printing a bare count that would read like a
+    // validated occupancy figure.
+    return `Context usage: ${formatTokens(used)} tokens used, context window not yet reported `
+      + '(token meter has not settled; treat this occupancy as unavailable).'
+  }
+  const percent = Math.min(100, Math.round(used / window * 100))
+  const row = `${formatTokens(used)} / ${formatTokens(window)} tokens used (${percent}%)`
+  if (percent < resolved.contextPressureWarnAt) return `Context usage: ${row}.`
+  const left = Math.max(0, window - used)
+  const steps = state?.contract?.budget ?? resolved.stepBudget
+  return `Context usage: ${row} - WARNING. Only ${formatTokens(left)} tokens remain, and `
+    + `this request's contract may still owe ~${steps} more steps. Once the window is compacted, `
+    + 'earlier context - including the original request and this contract - may no longer be '
+    + 'retrievable. If the remaining work cannot fit, say so plainly and say what will not fit, '
+    + 'rather than quietly narrowing what you deliver.'
+}
+
+/** Compact token counts so the line stays short in a prompt. */
+function formatTokens(value) {
+  if (value < 1000) return String(value)
+  if (value < 1_000_000) return `${(value / 1000).toFixed(1)}k`
+  return `${(value / 1_000_000).toFixed(2)}M`
+}
+
+/** Build one injected context message. */
 function contextMessage(text, form, summary) {
   return {
     id: `drift-guard-${globalThis.crypto.randomUUID()}`,
@@ -1443,9 +1492,17 @@ export function apply(ctx, config) {
       const agent = assemble?.scope
       if (agent?.session === undefined) return ''
       const state = stateOf(ctx, agent)
-      if (state === undefined) return ''
-      if (state.baseline === null && state.contract === null) return ''
       const parts = []
+      // Context occupancy is appended on EVERY request, including ones that carry
+      // no contract yet: it is exactly when the window is filling that the agent
+      // most needs to know, and the guard restates the request every turn anyway.
+      if (state !== undefined) {
+        const usage = renderContextUsage(ctx, agent, state, resolved)
+        if (usage !== undefined) parts.push(usage)
+      }
+      if (state === undefined || (state.baseline === null && state.contract === null)) {
+        return parts.join('\n\n')
+      }
       if (state.baseline !== null) parts.push(renderBaseline(state.baseline))
       parts.push(renderContract(state, resolved.stepBudget))
       return parts.join('\n\n')

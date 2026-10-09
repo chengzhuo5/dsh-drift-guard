@@ -157,7 +157,7 @@ function fakeHost(roots = []) {
         projection = definition
         return () => {}
       },
-      stateOf: session => session.__state,
+      stateOf: (session, key) => (key === 'contextPressure' ? session.__pressure : session.__state),
     },
     systemPrompt: {
       getSectionOrder: () => 1000,
@@ -1246,6 +1246,52 @@ await check('auto: off means every report asks the user', async () => {
   // route through the user, never approve on its own.
   assert.notEqual(value.decision, 'approve', 'with autoDrift off nothing self-resolves')
   assert.equal(value.note, '', 'and it carries no automatic note')
+})
+
+// ======================================================= context occupancy ==
+
+/** Render the prompt-context provider with one pressure reading installed. */
+function usageLine(pressure, config = {}) {
+  const roots = []
+  const host = fakeHost(roots)
+  apply(host.ctx, config)
+  const projection = host.projectionOf()
+  let state = projection.init()
+  for (const event of [turnStart(), human('Fix the login bug.'), step()]) state = projection.apply(state, event)
+  const session = { __state: state, __pressure: pressure, snapshotEvents: () => [] }
+  const agent = { session, id: 'a' }
+  roots.push(agent)
+  const provider = host.registered.contexts.find(entry => entry.name === 'drift-guard')
+  return provider.text({ scope: agent })
+}
+
+await check('usage: the current occupancy is appended on every request', async () => {
+  const text = usageLine({ contextWindow: 100_000, pressureTokens: 25_000 })
+  assert.match(text, /Context usage: 25\.0k \/ 100\.0k tokens used \(25%\)/)
+})
+await check('usage: projected tokens win over the last sample', async () => {
+  const text = usageLine({ contextWindow: 100_000, pressureTokens: 10_000, projectedTokens: 30_000 })
+  assert.match(text, /30\.0k \/ 100\.0k tokens used \(30%\)/)
+})
+await check('usage: a high-water mark warns instead of stating a bare number', async () => {
+  const text = usageLine({ contextWindow: 100_000, projectedTokens: 85_000 })
+  assert.match(text, /WARNING/)
+  assert.match(text, /15\.0k tokens remain/)
+  assert.match(text, /rather than quietly narrowing what you deliver/)
+})
+await check('usage: no meter at all adds nothing and invents nothing', async () => {
+  const text = usageLine(undefined)
+  assert.equal(text.includes('Context usage'), false, 'nothing is reported when nothing is measured')
+})
+await check('usage: a count without a window is marked unavailable', async () => {
+  const text = usageLine({ pressureTokens: 4_000 })
+  assert.match(text, /context window not yet reported/)
+  assert.match(text, /unavailable/)
+  assert.equal(/\(\d+%\)/.test(text), false, 'no percentage is invented')
+})
+await check('usage: reportContextUsage false silences the line', async () => {
+  const text = usageLine({ contextWindow: 100_000, projectedTokens: 50_000 }, { reportContextUsage: false })
+  assert.equal(text.includes('Context usage'), false)
 })
 
 // ==================================================================== report ==

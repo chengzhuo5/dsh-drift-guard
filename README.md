@@ -79,6 +79,32 @@
 
 最后一个是关键：**用户批准了新方向，但新契约还没提交**。这个窗口里会话若被打断，绝不能折成 `aligned`——否则是拿**过期契约**当有效。
 
+## 上下文用量（每次请求追加）
+
+每次请求都会往提示词里追加一行**当前上下文占用**：
+
+```
+Context usage: 132.4k / 1.00M tokens used (13%).
+```
+
+**数字来自 DSH 自己的 token-meter**（`ctx.sessionProjections.stateOf(session, 'contextPressure')`），本插件**不自己估算**。优先用 `projectedTokens`（token-meter 定义的"下一次请求的提示词会花多少"），无采样时回退 `pressureTokens`。理由：第二个用不同口径算出来的估计值会**和你界面上看到的数字对不上**，而一个错的占用率**看起来和一个对的没有区别**——所以宁可复用权威来源。
+
+**数据不可用时如实标注，绝不编造**：
+
+| 情况 | 输出 |
+|---|---|
+| token-meter 未报告 | 不加这一行（没有测量就没有数字） |
+| 有计数但窗口未知 | `context window not yet reported (…) treat this occupancy as unavailable` |
+| `reportContextUsage: false` | 整行静默 |
+
+**高水位（默认 ≥80%）会升级为告警**，并且不只是报数字——它会明确说清**契约风险**：
+
+> Only 150.0k tokens remain, and this request's contract may still owe ~12 more steps. Once the window is compacted, earlier context - including the original request and this contract - may no longer be retrievable. If the remaining work cannot fit, say so plainly and say what will not fit, **rather than quietly narrowing what you deliver**.
+
+这一段刻意接上相位敏感性那一节：窗口被压缩后**原始请求可能检索不到**，而"悄悄地少做一点"是这种情况下最自然的失败方式。用量行是**提前预警**，不是事后解释。
+
+配置：`reportContextUsage`（默认 `true`）、`contextPressureWarnAt`（默认 `80`）。
+
 ## 全自动模式与三道机械闸门
 
 用户可以选择**不被偏移决策打断**。这条路解决了"每次都来问我"的烦扰，但代价必须写清：
